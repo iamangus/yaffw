@@ -50,6 +50,7 @@ type TranscodeJob struct {
 	// Recovery deduplication tracking
 	RecoveryInProgress bool      // Set to true when JIT recovery is triggered
 	LastRecoveryTime   time.Time // Timestamp of last recovery trigger
+	LastAccessedAt     time.Time // Timestamp of last client access (playlist or segment)
 
 	// V2: Segment Tracking for Ephemeral Workers
 	Segments []Segment

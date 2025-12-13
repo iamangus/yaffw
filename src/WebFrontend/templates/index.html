@@ -179,6 +179,7 @@
 
         // Detect client capabilities on load
         const clientCapabilities = detectCapabilities();
+        let currentMediaId = null;
         
         function detectCapabilities() {
             const caps = {
@@ -227,6 +228,7 @@
         }
 
         async function playVideo(id) {
+            currentMediaId = id;
             const modal = document.getElementById('video-modal');
             const video = document.getElementById('main-player');
             const playbackMode = document.getElementById('playback-mode');
@@ -415,6 +417,13 @@
             const video = document.getElementById('main-player');
             const playbackMode = document.getElementById('playback-mode');
             
+            // Stop server session immediately
+            if (currentMediaId) {
+                console.log("Stopping session for", currentMediaId);
+                fetch('/api/session/' + currentMediaId, { method: 'DELETE' });
+                currentMediaId = null;
+            }
+
             video.pause();
             if (window.hls) {
                 window.hls.destroy();
@@ -431,6 +440,17 @@
         // Close on Escape key
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') closeVideo();
+        });
+
+        // Close session on tab close/navigate
+        window.addEventListener('beforeunload', () => {
+            if (currentMediaId) {
+                // use fetch with keepalive for reliability during unload (supports DELETE)
+                fetch('/api/session/' + currentMediaId, { 
+                    method: 'DELETE',
+                    keepalive: true
+                });
+            }
         });
     </script>
 </body>

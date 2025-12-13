@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"log"
 
 	_ "github.com/lib/pq"
@@ -15,32 +14,22 @@ type PostgresJobQueue struct {
 	db *sql.DB
 }
 
-func NewJobQueue(connStr string) (*PostgresJobQueue, error) {
+func NewConnection(connStr string) (*sql.DB, error) {
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		return nil, err
 	}
-
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
+	return db, nil
+}
 
-	pq := &PostgresJobQueue{db: db}
-	if err := pq.InitSchema(); err != nil {
-		return nil, fmt.Errorf("failed to init schema: %w", err)
-	}
-
-	// Wipe old data for clean slate as requested
-	pq.db.Exec("TRUNCATE TABLE transcode_jobs CASCADE")
-
-	return pq, nil
+func NewJobQueue(db *sql.DB) *PostgresJobQueue {
+	return &PostgresJobQueue{db: db}
 }
 
 func (q *PostgresJobQueue) InitSchema() error {
-	// Drop tables to ensure schema update (since we are changing TIMESTAMP to TIMESTAMPTZ)
-	q.db.Exec("DROP TABLE IF EXISTS job_segments CASCADE")
-	q.db.Exec("DROP TABLE IF EXISTS transcode_jobs CASCADE")
-
 	// Create transcode_jobs table
 	_, err := q.db.Exec(`
 		CREATE TABLE IF NOT EXISTS transcode_jobs (
@@ -63,12 +52,16 @@ func (q *PostgresJobQueue) InitSchema() error {
 			start_time FLOAT DEFAULT 0,
 			recovery_in_progress BOOLEAN DEFAULT FALSE,
 			last_recovery_time TIMESTAMPTZ,
+			last_accessed_at TIMESTAMPTZ DEFAULT NOW(),
 			created_at TIMESTAMPTZ DEFAULT NOW()
 		);
 	`)
 	if err != nil {
 		return err
 	}
+
+	// Migration: Add last_accessed_at if it doesn't exist
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ DEFAULT NOW();`)
 
 	// Create job_segments table
 	_, err = q.db.Exec(`
@@ -92,11 +85,11 @@ func (q *PostgresJobQueue) Enqueue(ctx context.Context, job *domain.TranscodeJob
 		INSERT INTO transcode_jobs (
 			id, media_id, file_path, status, target_video_codec, target_audio_codec, 
 			target_container, needs_transcode, restart_count, start_segment, start_time,
-			recovery_in_progress, last_recovery_time
+			recovery_in_progress, last_recovery_time, last_accessed_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, 
 			$7, $8, $9, $10, $11,
-			$12, $13
+			$12, $13, NOW()
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status,
@@ -104,7 +97,8 @@ func (q *PostgresJobQueue) Enqueue(ctx context.Context, job *domain.TranscodeJob
 			start_segment = EXCLUDED.start_segment,
 			start_time = EXCLUDED.start_time,
 			recovery_in_progress = EXCLUDED.recovery_in_progress,
-			last_recovery_time = EXCLUDED.last_recovery_time;
+			last_recovery_time = EXCLUDED.last_recovery_time,
+			last_accessed_at = NOW();
 	`
 
 	_, err := q.db.ExecContext(ctx, query,
@@ -136,20 +130,20 @@ func (q *PostgresJobQueue) Dequeue(ctx context.Context) (*domain.TranscodeJob, e
 			id, media_id, file_path, status, worker_id, worker_address, stream_url,
 			target_video_codec, target_audio_codec, target_container, needs_transcode,
 			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
-			start_segment, start_time, recovery_in_progress, last_recovery_time;
+			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at;
 	`
 
 	row := q.db.QueryRowContext(ctx, query)
 
 	job := &domain.TranscodeJob{}
 	var workerID, workerAddr, streamUrl sql.NullString
-	var lastHeartbeat, lastRecoveryTime sql.NullTime
+	var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
 
 	err := row.Scan(
 		&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &workerAddr, &streamUrl,
 		&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
 		&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
-		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime,
+		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -164,6 +158,7 @@ func (q *PostgresJobQueue) Dequeue(ctx context.Context) (*domain.TranscodeJob, e
 	job.StreamURL = streamUrl.String
 	job.LastHeartbeat = lastHeartbeat.Time
 	job.LastRecoveryTime = lastRecoveryTime.Time
+	job.LastAccessedAt = lastAccessedAt.Time
 
 	log.Printf("[PostgresQueue] Dequeued job %s", job.ID)
 	return job, nil
@@ -175,20 +170,20 @@ func (q *PostgresJobQueue) GetJob(ctx context.Context, jobID string) (*domain.Tr
 			id, media_id, file_path, status, worker_id, worker_address, stream_url,
 			target_video_codec, target_audio_codec, target_container, needs_transcode,
 			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
-			start_segment, start_time, recovery_in_progress, last_recovery_time
+			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at
 		FROM transcode_jobs WHERE id = $1
 	`
 	row := q.db.QueryRowContext(ctx, query, jobID)
 
 	job := &domain.TranscodeJob{}
 	var workerID, workerAddr, streamUrl sql.NullString
-	var lastHeartbeat, lastRecoveryTime sql.NullTime
+	var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
 
 	err := row.Scan(
 		&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &workerAddr, &streamUrl,
 		&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
 		&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
-		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime,
+		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -199,6 +194,7 @@ func (q *PostgresJobQueue) GetJob(ctx context.Context, jobID string) (*domain.Tr
 	job.StreamURL = streamUrl.String
 	job.LastHeartbeat = lastHeartbeat.Time
 	job.LastRecoveryTime = lastRecoveryTime.Time
+	job.LastAccessedAt = lastAccessedAt.Time
 
 	// Fetch segments
 	segments, err := q.getSegments(ctx, jobID)
@@ -243,12 +239,22 @@ func (q *PostgresJobQueue) UpdateJob(ctx context.Context, job *domain.TranscodeJ
 			transcoded_duration = GREATEST(transcoded_duration, $9)
 		WHERE id = $1
 	`
-	_, err := q.db.ExecContext(ctx, query,
+	res, err := q.db.ExecContext(ctx, query,
 		job.ID, job.Status, job.WorkerID, job.WorkerAddress, job.StreamURL,
 		job.LastHeartbeat, job.RecoveryInProgress,
 		job.LastSegmentNum, job.TranscodedDuration,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("job not found")
+	}
+	return nil
 }
 
 func (q *PostgresJobQueue) AddSegment(ctx context.Context, jobID string, segment domain.Segment) error {
@@ -343,15 +349,34 @@ func (q *PostgresJobQueue) PurgeJobs(ctx context.Context, jobID string) error {
 	return nil
 }
 
+func (q *PostgresJobQueue) DeleteJob(ctx context.Context, jobID string) error {
+	// Delete segments first (FK)
+	_, err := q.db.ExecContext(ctx, "DELETE FROM job_segments WHERE job_id = $1", jobID)
+	if err != nil {
+		return err
+	}
+	// Delete job
+	_, err = q.db.ExecContext(ctx, "DELETE FROM transcode_jobs WHERE id = $1", jobID)
+	if err == nil {
+		log.Printf("[PostgresQueue] Deleted job %s and its segments", jobID)
+	}
+	return err
+}
+
+func (q *PostgresJobQueue) TouchJob(ctx context.Context, jobID string) error {
+	_, err := q.db.ExecContext(ctx, "UPDATE transcode_jobs SET last_accessed_at = NOW() WHERE id = $1", jobID)
+	return err
+}
+
 func (q *PostgresJobQueue) ListActiveJobs(ctx context.Context) ([]*domain.TranscodeJob, error) {
 	query := `
 		SELECT 
 			id, media_id, file_path, status, worker_id, worker_address, stream_url,
 			target_video_codec, target_audio_codec, target_container, needs_transcode,
 			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
-			start_segment, start_time, recovery_in_progress, last_recovery_time
+			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at
 		FROM transcode_jobs 
-		WHERE status IN ('Processing', 'Ready')
+		WHERE status IN ('Processing', 'Ready', 'Pending', 'Completed')
 	`
 	rows, err := q.db.QueryContext(ctx, query)
 	if err != nil {
@@ -363,13 +388,13 @@ func (q *PostgresJobQueue) ListActiveJobs(ctx context.Context) ([]*domain.Transc
 	for rows.Next() {
 		job := &domain.TranscodeJob{}
 		var workerID, workerAddr, streamUrl sql.NullString
-		var lastHeartbeat, lastRecoveryTime sql.NullTime
+		var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
 
 		err := rows.Scan(
 			&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &workerAddr, &streamUrl,
 			&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
 			&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
-			&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime,
+			&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
 		)
 		if err != nil {
 			return nil, err
@@ -380,6 +405,7 @@ func (q *PostgresJobQueue) ListActiveJobs(ctx context.Context) ([]*domain.Transc
 		job.StreamURL = streamUrl.String
 		job.LastHeartbeat = lastHeartbeat.Time
 		job.LastRecoveryTime = lastRecoveryTime.Time
+		job.LastAccessedAt = lastAccessedAt.Time
 
 		// NOTE: We generally don't need full segments list for the monitor check,
 		// but if we did, we'd fetch them here.

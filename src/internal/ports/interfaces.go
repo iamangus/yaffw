@@ -20,6 +20,8 @@ type JobQueue interface {
 	AddSegment(ctx context.Context, jobID string, segment domain.Segment) error
 	MarkWorkerAsDead(ctx context.Context, jobID string, workerID string) (int, error)
 	PurgeJobs(ctx context.Context, jobID string) error
+	DeleteJob(ctx context.Context, jobID string) error
+	TouchJob(ctx context.Context, jobID string) error
 	// Management
 	ListActiveJobs(ctx context.Context) ([]*domain.TranscodeJob, error)
 }

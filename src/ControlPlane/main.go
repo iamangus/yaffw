@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/yaffw/yaffw/src/internal/adapters/http_queue"
-	"github.com/yaffw/yaffw/src/internal/adapters/memory"
 	"github.com/yaffw/yaffw/src/internal/adapters/postgres"
 	"github.com/yaffw/yaffw/src/internal/domain"
 	"github.com/yaffw/yaffw/src/internal/ports"
@@ -32,10 +31,8 @@ func main() {
 	var jobQueue ports.JobQueue
 
 	log.Println("Running in PRODUCTION mode")
-	// Use memory repo for media for now (todo: implement postgres media repo)
-	mediaRepo = memory.NewMediaRepo()
 
-	// Initialize Postgres Job Queue
+	// Connect to Postgres
 	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
 		// Default for dev/docker
@@ -43,12 +40,26 @@ func main() {
 		log.Printf("No DATABASE_URL set, using default: %s", connStr)
 	}
 
-	pq, err := postgres.NewJobQueue(connStr)
+	db, err := postgres.NewConnection(connStr)
 	if err != nil {
-		log.Fatalf("Failed to connect to Postgres Queue: %v", err)
+		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
-	jobQueue = pq
-	log.Println("Connected to Postgres Job Queue")
+
+	// Initialize Postgres Media Repo
+	pgMediaRepo := postgres.NewMediaRepo(db)
+	if err := pgMediaRepo.InitSchema(); err != nil {
+		log.Fatalf("Failed to init media schema: %v", err)
+	}
+	mediaRepo = pgMediaRepo
+
+	// Initialize Postgres Job Queue
+	pgJobQueue := postgres.NewJobQueue(db)
+	if err := pgJobQueue.InitSchema(); err != nil {
+		log.Fatalf("Failed to init queue schema: %v", err)
+	}
+	jobQueue = pgJobQueue
+
+	log.Println("Connected to Postgres (MediaRepo + JobQueue)")
 
 	// Seed data from 'data' directory
 	scanner := services.NewLibraryScanner(mediaRepo)
@@ -69,6 +80,9 @@ func main() {
 
 	// Start Passive Recovery Monitor (JIT-Aware Reaper)
 	go startPassiveRecoveryMonitor(context.Background(), jobQueue)
+
+	// Start Session Watchdog (Cleans up idle jobs)
+	go startSessionWatchdog(context.Background(), jobQueue)
 
 	// 2. Expose Queue via HTTP
 	// We expose this in ALL modes now, so Workers can always connect via HTTP
@@ -137,6 +151,9 @@ func main() {
 			http.Error(w, "Job not found", http.StatusNotFound)
 			return
 		}
+
+		// Keep job alive
+		jobQueue.TouchJob(r.Context(), jobID)
 
 		// 2. Handle Playlist
 		if strings.HasSuffix(filename, ".m3u8") {
@@ -235,6 +252,31 @@ func main() {
 	// Smart Playback API
 	mux.HandleFunc("/api/playback/", func(w http.ResponseWriter, r *http.Request) {
 		handlePlaybackRequest(w, r, mediaRepo, jobQueue)
+	})
+
+	// Session Management API (Stop Transcoding)
+	mux.HandleFunc("/api/session/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "DELETE required", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse media ID from path /api/session/{id}
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) < 4 {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+		mediaID := parts[3]
+		jobID := "job-" + mediaID
+
+		log.Printf("[Session] Explicit stop request for media %s (Job %s)", mediaID, jobID)
+
+		if err := jobQueue.DeleteJob(r.Context(), jobID); err != nil {
+			log.Printf("[Session] Failed to stop job %s: %v", jobID, err)
+			// Don't error out to client, as they are leaving anyway
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	// Stream Handlers (Direct Play + HLS)
@@ -413,6 +455,9 @@ func handleHLS(w http.ResponseWriter, r *http.Request, repo ports.MediaRepositor
 		}
 		queue.Enqueue(r.Context(), newJob)
 		job = newJob
+	} else {
+		// Job exists, touch it
+		queue.TouchJob(r.Context(), jobID)
 	}
 
 	// Poll Status (Wait for at least one segment or Ready status)
@@ -579,6 +624,44 @@ func triggerJITRecovery(ctx context.Context, queue ports.JobQueue, job *domain.T
 
 // startPassiveRecoveryMonitor checks for dead jobs and triggers JIT recovery
 // This replaces the old "Reaper" service with a smarter, state-aware recovery mechanism.
+func startSessionWatchdog(ctx context.Context, queue ports.JobQueue) {
+	log.Println("Starting Session Watchdog...")
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			jobs, err := queue.ListActiveJobs(ctx)
+			if err != nil {
+				log.Printf("[Watchdog] Failed to list jobs: %v", err)
+				continue
+			}
+
+			now := time.Now()
+			// Timeout after 60 seconds of inactivity
+			threshold := 60 * time.Second
+
+			for _, job := range jobs {
+				// Check LastAccessedAt
+				if !job.LastAccessedAt.IsZero() && now.Sub(job.LastAccessedAt) > threshold {
+					log.Printf("[Watchdog] 🛑 Job %s IDLE TIMEOUT (Last accessed: %s ago). Deleting...",
+						job.ID, now.Sub(job.LastAccessedAt))
+
+					// Delete the job (Worker will detect "Job Not Found" or Update error and exit)
+					if err := queue.DeleteJob(ctx, job.ID); err != nil {
+						log.Printf("[Watchdog] Failed to delete job %s: %v", job.ID, err)
+					}
+				}
+			}
+		}
+	}
+}
+
+// startPassiveRecoveryMonitor checks for dead jobs and triggers JIT recovery
+// This replaces the old "Reaper" service with a smarter, state-aware recovery mechanism.
 func startPassiveRecoveryMonitor(ctx context.Context, queue ports.JobQueue) {
 	log.Println("Starting Passive Recovery Monitor (JIT-Aware)...")
 	ticker := time.NewTicker(1 * time.Second) // Check every second for fast recovery
@@ -599,6 +682,11 @@ func startPassiveRecoveryMonitor(ctx context.Context, queue ports.JobQueue) {
 			threshold := 3 * time.Second // Fast Recovery: Allow 3 missed heartbeats (3s)
 
 			for _, job := range jobs {
+				// Skip Completed jobs (they don't need heartbeats)
+				if job.Status == "Completed" {
+					continue
+				}
+
 				if !job.LastHeartbeat.IsZero() && now.Sub(job.LastHeartbeat) > threshold {
 					log.Printf("[Recovery] ⚠️ DETECTED DEAD WORKER (ID: %s) for Job %s. Last heartbeat: %s ago.",
 						job.WorkerID, job.ID, now.Sub(job.LastHeartbeat))

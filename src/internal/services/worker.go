@@ -136,22 +136,43 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 
 	outputPath := filepath.Join(jobDir, "stream.m3u8")
 
+	// Create a cancellable context for this job to kill ffmpeg/heartbeats on failure/cancellation
+	jobCtx, jobCancel := context.WithCancel(ctx)
+	defer jobCancel()
+
 	// Start Heartbeat Loop (Managed via context)
 	// We start this AFTER sending the first update, but parallel to FFmpeg
-	hbCtx, hbCancel := context.WithCancel(context.Background())
-	defer hbCancel() // Safety fallback
-
+	// Use jobCtx so we can cancel it if the job is cancelled
 	go func() {
 		ticker := time.NewTicker(1 * time.Second) // Fast Heartbeat (1s)
 		defer ticker.Stop()
+
+		statusTicker := time.NewTicker(5 * time.Second)
+		defer statusTicker.Stop()
+
 		for {
 			select {
-			case <-hbCtx.Done():
+			case <-jobCtx.Done():
 				return
+			case <-statusTicker.C:
+				// Check status periodically
+				currentJob, err := w.queue.GetJob(context.Background(), job.ID)
+				if err != nil {
+					log.Printf("[Worker %s] Job %s missing/deleted. Stopping.", w.workerID, job.ID)
+					jobCancel()
+					return
+				}
+				if currentJob.Status == "Cancelled" {
+					log.Printf("[Worker %s] Job %s was Cancelled. Stopping.", w.workerID, job.ID)
+					jobCancel()
+					return
+				}
 			case <-ticker.C:
 				job.LastHeartbeat = time.Now()
 				if err := w.queue.UpdateJob(context.Background(), job); err != nil {
-					log.Printf("[Worker %s] WARNING: Heartbeat update failed for job %s: %v", w.workerID, job.ID, err)
+					log.Printf("[Worker %s] ERROR: Heartbeat failed for job %s (Job lost/cancelled?): %v", w.workerID, job.ID, err)
+					jobCancel() // Kill ffmpeg
+					return
 				}
 			}
 		}
@@ -186,7 +207,7 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 
 	// Build FFmpeg command based on job settings
 	args := w.buildFFmpegArgs(job, jobDir, outputPath, startSegment, startTime)
-	cmd := exec.Command(w.ffmpegPath, args...)
+	cmd := exec.CommandContext(jobCtx, w.ffmpegPath, args...)
 
 	// Redirect logs to file for debugging
 	logFile, err := os.Create(filepath.Join(w.logsDir, fmt.Sprintf("ffmpeg-%s.log", job.ID)))
@@ -238,16 +259,25 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 
 	// Start Segment Watcher AFTER FFmpeg is ready and we know the start segment
 	// Pass startSegment so the watcher only reports segments this worker creates
-	go w.watchSegments(hbCtx, job.ID, jobDir, startSegment)
+	go w.watchSegments(jobCtx, job.ID, jobDir, startSegment)
 
 	// Wait for completion (blocking this goroutine to keep heartbeats alive)
 	err = cmd.Wait()
-	hbCancel() // Stop heartbeats and watcher only after FFmpeg finishes
+	// jobCancel deferred above will clean up heartbeats
 
 	if err != nil {
-		log.Printf("[Worker %s] Job %s FFmpeg finished with error: %v", w.workerID, job.ID, err)
+		if jobCtx.Err() != nil {
+			log.Printf("[Worker %s] Job %s Cancelled/Stopped.", w.workerID, job.ID)
+		} else {
+			log.Printf("[Worker %s] Job %s FFmpeg finished with error: %v", w.workerID, job.ID, err)
+		}
 	} else {
 		log.Printf("[Worker %s] Job %s FFmpeg finished successfully", w.workerID, job.ID)
+		// Mark as Completed so Control Plane stops expecting heartbeats
+		job.Status = "Completed"
+		if err := w.queue.UpdateJob(context.Background(), job); err != nil {
+			log.Printf("[Worker %s] Failed to mark job %s as Completed: %v", w.workerID, job.ID, err)
+		}
 	}
 }
 

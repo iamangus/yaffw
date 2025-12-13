@@ -23,6 +23,21 @@ func (h *HTTPServerQueue) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/internal/queue/dequeue", h.handleDequeue)
 	mux.HandleFunc("/internal/queue/update", h.handleUpdate)
 	mux.HandleFunc("/internal/queue/add_segment", h.handleAddSegment)
+	mux.HandleFunc("/internal/queue/get_job", h.handleGetJob)
+}
+
+func (h *HTTPServerQueue) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("id")
+	if jobID == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	job, err := h.queue.GetJob(r.Context(), jobID)
+	if err != nil {
+		http.Error(w, "Job not found", http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(job)
 }
 
 func (h *HTTPServerQueue) handleDequeue(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +72,9 @@ func (h *HTTPServerQueue) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		job.RecoveryInProgress = false
 	} else if job.Status == "Failed" {
 		log.Printf("[HTTP Queue] ❌ Worker %s reports job %s FAILED", job.WorkerID, job.ID)
+		job.RecoveryInProgress = false
+	} else if job.Status == "Completed" {
+		log.Printf("[HTTP Queue] ✅ Worker %s reports job %s COMPLETED", job.WorkerID, job.ID)
 		job.RecoveryInProgress = false
 	}
 

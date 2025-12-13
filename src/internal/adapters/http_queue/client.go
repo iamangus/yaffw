@@ -54,8 +54,21 @@ func (q *HTTPClientQueue) Dequeue(ctx context.Context) (*domain.TranscodeJob, er
 }
 
 func (q *HTTPClientQueue) GetJob(ctx context.Context, jobID string) (*domain.TranscodeJob, error) {
-	// Used by Control Plane, not Compute client usually
-	return nil, errors.New("not implemented")
+	resp, err := q.client.Get(q.baseURL + "/get_job?id=" + jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("job not found: %d", resp.StatusCode)
+	}
+
+	var job domain.TranscodeJob
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return nil, err
+	}
+	return &job, nil
 }
 
 func (q *HTTPClientQueue) UpdateJob(ctx context.Context, job *domain.TranscodeJob) error {
@@ -116,4 +129,12 @@ func (q *HTTPClientQueue) PurgeJobs(ctx context.Context, jobID string) error {
 func (q *HTTPClientQueue) ListActiveJobs(ctx context.Context) ([]*domain.TranscodeJob, error) {
 	// Not used by worker
 	return nil, errors.New("not implemented")
+}
+
+func (q *HTTPClientQueue) DeleteJob(ctx context.Context, jobID string) error {
+	return errors.New("not implemented for client")
+}
+
+func (q *HTTPClientQueue) TouchJob(ctx context.Context, jobID string) error {
+	return errors.New("not implemented for client")
 }
