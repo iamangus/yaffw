@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>yaffw</title>
+    
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+
+    <!-- Client Logging -->
+    <script>
+        (function() {
+            const originalLog = console.log;
+            const originalWarn = console.warn;
+            const originalError = console.error;
+
+            function sendLog(level, args) {
+                const message = Array.from(args).map(arg => {
+                    if (typeof arg === 'object') {
+                        try { return JSON.stringify(arg); } catch(e) { return String(arg); }
+                    }
+                    return String(arg);
+                }).join(' ');
+
+                fetch('/client-log', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ level, message })
+                }).catch(() => {});
+            }
+
+            console.log = function(...args) {
+                originalLog.apply(console, args);
+                sendLog('INFO', args);
+            };
+            console.warn = function(...args) {
+                originalWarn.apply(console, args);
+                sendLog('WARN', args);
+            };
+            console.error = function(...args) {
+                originalError.apply(console, args);
+                sendLog('ERROR', args);
+            };
+        })();
+    </script>
+    
+    <!-- Tailwind CSS (Dev Mode) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#00a4dc',
+                        secondary: '#aa5cc3'
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Franken-UI / UIkit -->
+    <link rel="stylesheet" href="https://unpkg.com/franken-ui@1.1.0/dist/css/core.min.css" />
+    <script src="https://unpkg.com/franken-ui@1.1.0/dist/js/core.iife.js" type="module"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen font-sans antialiased">
+    
+    <!-- Navigation -->
+    <nav class="border-b border-zinc-800 bg-zinc-900/50 backdrop-blur-xl sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center gap-8">
+                    <div class="flex-shrink-0 font-bold text-2xl text-primary tracking-tight">
+                        yaffw<span class="text-white">-ng</span>
+                    </div>
+                    <div class="hidden md:block">
+                        <div class="flex items-baseline space-x-4">
+                            <a href="#" class="bg-zinc-800 text-white px-3 py-2 rounded-md text-sm font-medium">Home</a>
+                            <a href="#" class="text-zinc-400 hover:text-white px-3 py-2 rounded-md text-sm font-medium">Movies</a>
+                            <a href="#" class="text-zinc-400 hover:text-white px-3 py-2 rounded-md text-sm font-medium">Shows</a>
+                            <a href="#" class="text-zinc-400 hover:text-white px-3 py-2 rounded-md text-sm font-medium">Music</a>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center gap-4">
+                     <button class="p-2 text-zinc-400 hover:text-white">
+                        <i data-lucide="search" class="w-5 h-5"></i>
+                    </button>
+                    <button class="p-2 text-zinc-400 hover:text-white">
+                        <i data-lucide="bell" class="w-5 h-5"></i>
+                    </button>
+                    <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-primary to-secondary"></div>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Hero / Continue Watching -->
+        <section class="mb-12">
+            <h2 class="text-2xl font-bold mb-6 flex items-center gap-2">
+                <i data-lucide="play-circle" class="w-6 h-6 text-primary"></i>
+                Continue Watching
+            </h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {{range .ContinueWatching}}
+                <!-- Card -->
+                <div onclick="playVideo('{{.ID}}')" class="group relative aspect-video bg-zinc-900 rounded-lg overflow-hidden border border-zinc-800 hover:border-zinc-700 transition-all cursor-pointer">
+                    <div class="absolute inset-0 flex items-center justify-center text-zinc-700">
+                        {{if .PosterURL}}
+                        <img src="{{.PosterURL}}" class="w-full h-full object-cover opacity-50 group-hover:opacity-75 transition" alt="{{.Title}}">
+                        {{else}}
+                        <i data-lucide="image" class="w-12 h-12"></i>
+                        {{end}}
+                        <!-- Play Icon Overlay -->
+                        <div class="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition duration-300">
+                             <div class="bg-primary/90 rounded-full p-4 shadow-lg transform scale-90 group-hover:scale-100 transition">
+                                <i data-lucide="play" class="w-6 h-6 text-white fill-current"></i>
+                             </div>
+                        </div>
+                    </div>
+                    <div class="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent flex flex-col justify-end p-4">
+                        <h3 class="font-bold text-lg">{{.Title}}</h3>
+                        <div class="w-full bg-zinc-800 h-1 rounded-full mt-2 overflow-hidden">
+                            <div class="bg-primary h-full" style="width: 45%"></div>
+                        </div>
+                    </div>
+                </div>
+                {{end}}
+            </div>
+        </section>
+
+        <!-- Libraries -->
+        <section>
+            <h2 class="text-2xl font-bold mb-6">My Media</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                <div class="bg-zinc-900 aspect-[2/3] rounded-lg border border-zinc-800 flex flex-col items-center justify-center hover:bg-zinc-800 transition cursor-pointer">
+                    <i data-lucide="film" class="w-8 h-8 text-zinc-600 mb-2"></i>
+                    <span class="font-medium text-sm">Movies</span>
+                </div>
+                <div class="bg-zinc-900 aspect-[2/3] rounded-lg border border-zinc-800 flex flex-col items-center justify-center hover:bg-zinc-800 transition cursor-pointer">
+                     <i data-lucide="tv" class="w-8 h-8 text-zinc-600 mb-2"></i>
+                    <span class="font-medium text-sm">TV Shows</span>
+                </div>
+            </div>
+        </section>
+        
+        <div class="mt-12 p-4 bg-zinc-900/50 rounded border border-zinc-800">
+             <p class="text-sm text-zinc-500 font-mono">Control Plane Status: <span class="text-emerald-500">Active</span></p>
+             <p id="capabilities-info" class="text-sm text-zinc-500 font-mono mt-1"></p>
+             <button hx-post="/api/ping" hx-swap="innerHTML" class="mt-4 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded text-sm transition">
+                Ping Server
+             </button>
+             <div id="ping-response" class="mt-2 text-sm text-zinc-400"></div>
+        </div>
+
+    </main>
+
+    <!-- Simple Video Modal -->
+    <div id="video-modal" class="fixed inset-0 z-[100] bg-black/90 backdrop-blur-sm hidden flex items-center justify-center p-4">
+        <div class="relative w-full max-w-5xl bg-black rounded-lg overflow-hidden shadow-2xl border border-zinc-800">
+            <div class="absolute top-4 right-4 z-10 flex gap-2">
+                <span id="playback-mode" class="text-xs bg-zinc-800 text-zinc-300 px-2 py-1 rounded"></span>
+                <button onclick="closeVideo()" class="text-white/70 hover:text-white bg-black/50 hover:bg-black/80 rounded-full p-2 transition">
+                    <i data-lucide="x" class="w-6 h-6"></i>
+                </button>
+            </div>
+            <video id="main-player" controls class="w-full aspect-video bg-black"></video>
+        </div>
+    </div>
+    
+    <script>
+        lucide.createIcons();
+
+        // Detect client capabilities on load
+        const clientCapabilities = detectCapabilities();
+        
+        function detectCapabilities() {
+            const caps = {
+                // Video codecs
+                h264: MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"') || 
+                      MediaSource.isTypeSupported('video/mp4; codecs="avc1.4D401E"') ||
+                      MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001E"'),
+                h265: MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
+                      MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.B0"'),
+                vp9: MediaSource.isTypeSupported('video/webm; codecs="vp9"') ||
+                     MediaSource.isTypeSupported('video/mp4; codecs="vp09.00.10.08"'),
+                av1: MediaSource.isTypeSupported('video/mp4; codecs="av01.0.01M.08"'),
+                
+                // Audio codecs
+                aac: MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"'),
+                ac3: MediaSource.isTypeSupported('audio/mp4; codecs="ac-3"'),
+                eac3: MediaSource.isTypeSupported('audio/mp4; codecs="ec-3"'),
+                opus: MediaSource.isTypeSupported('audio/webm; codecs="opus"'),
+                
+                // Containers
+                hls: Hls.isSupported() || document.createElement('video').canPlayType('application/vnd.apple.mpegurl') !== '',
+                mp4: document.createElement('video').canPlayType('video/mp4') !== '',
+                webm: document.createElement('video').canPlayType('video/webm') !== '',
+                mkv: false, // Browsers don't support MKV directly
+                
+                // Max resolution (approximate based on screen)
+                maxWidth: window.screen.width * window.devicePixelRatio,
+                maxHeight: window.screen.height * window.devicePixelRatio
+            };
+            
+            // Display capabilities
+            const supported = [];
+            if (caps.h264) supported.push('H.264');
+            if (caps.h265) supported.push('HEVC');
+            if (caps.vp9) supported.push('VP9');
+            if (caps.av1) supported.push('AV1');
+            if (caps.aac) supported.push('AAC');
+            if (caps.ac3) supported.push('AC3');
+            if (caps.eac3) supported.push('E-AC3');
+            
+            document.getElementById('capabilities-info').textContent = 
+                'Client Codecs: ' + supported.join(', ');
+            
+            console.log('Detected Capabilities:', caps);
+            return caps;
+        }
+
+        async function playVideo(id) {
+            const modal = document.getElementById('video-modal');
+            const video = document.getElementById('main-player');
+            const playbackMode = document.getElementById('playback-mode');
+
+            modal.classList.remove('hidden');
+            playbackMode.textContent = 'Checking...';
+
+            try {
+                // Call smart playback API
+                const response = await fetch('/api/playback/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        mediaId: id,
+                        capabilities: clientCapabilities
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Playback API failed');
+                }
+
+                const playback = await response.json();
+                console.log('Playback decision:', playback);
+
+                if (playback.type === 'direct') {
+                    // Direct Play
+                    playbackMode.textContent = 'Direct Play';
+                    playbackMode.classList.remove('bg-zinc-800');
+                    playbackMode.classList.add('bg-emerald-800');
+                    
+                    video.src = playback.url;
+                    video.play().catch(e => console.log("Autoplay blocked:", e));
+                } else {
+                    // Transcode via HLS
+                    playbackMode.textContent = 'Transcoding';
+                    playbackMode.classList.remove('bg-zinc-800');
+                    playbackMode.classList.add('bg-amber-800');
+                    
+                    if (Hls.isSupported()) {
+                        const hls = new Hls({
+                            // Aggressive playlist refresh for live transcoding
+                            levelLoadingMaxRetry: 10,
+                            manifestLoadingMaxRetry: 10,
+                            fragLoadingMaxRetry: 10,
+                            levelLoadingRetryDelay: 500,
+                            fragLoadingRetryDelay: 500,
+                            
+                            // Keep buffer small to handle discontinuities better
+                            maxBufferLength: 30,
+                            maxMaxBufferLength: 60,
+                            
+                            // Start from beginning, not live edge
+                            startPosition: 0,
+                            liveSyncDuration: 0,
+                            
+                            // Enable worker for better performance
+                            enableWorker: true,
+                            
+                            // Low latency settings for live transcoding
+                            backBufferLength: 30,
+                        });
+                        
+                        hls.loadSource(playback.url);
+                        hls.attachMedia(video);
+                        
+                        // Track current playback position
+                        let lastKnownTime = 0;
+                        let lastKnownBuffered = 0;
+                        
+                        video.addEventListener('timeupdate', () => {
+                            lastKnownTime = video.currentTime;
+                            if (video.buffered.length > 0) {
+                                lastKnownBuffered = video.buffered.end(video.buffered.length - 1);
+                            }
+                        });
+                        
+                        hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+                            console.log("HLS Manifest parsed:", data.levels.length, "levels");
+                            video.play().catch(e => console.log("Autoplay blocked:", e));
+                        });
+                        
+                        // Log fragment loading for debugging
+                        hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
+                            console.log("Fragment loaded:", data.frag.sn, 
+                                        "start:", data.frag.start.toFixed(2),
+                                        "duration:", data.frag.duration.toFixed(2));
+                        });
+                        
+                        // Detect and handle discontinuities
+                        hls.on(Hls.Events.FRAG_CHANGED, function(event, data) {
+                            if (data.frag.discontinuity) {
+                                console.log("Crossed discontinuity at fragment:", data.frag.sn);
+                            }
+                        });
+                        
+                        hls.on(Hls.Events.LEVEL_LOADED, function(event, data) {
+                            const details = data.details;
+                            console.log("Level loaded - fragments:", details.fragments.length, 
+                                        "duration:", details.totalduration.toFixed(2),
+                                        "live:", details.live);
+                        });
+                        
+                        // Handle buffer stalls by checking if more data is available
+                        hls.on(Hls.Events.ERROR, function (event, data) {
+                            console.warn("HLS Event:", data.type, data.details, "fatal:", data.fatal);
+                            
+                            if (data.fatal) {
+                                switch(data.type) {
+                                    case Hls.ErrorTypes.NETWORK_ERROR:
+                                        console.log("Network error, retrying in 1s...");
+                                        setTimeout(() => hls.startLoad(), 1000);
+                                        break;
+                                    case Hls.ErrorTypes.MEDIA_ERROR:
+                                        console.log("Media error, attempting recovery...");
+                                        hls.recoverMediaError();
+                                        break;
+                                    default:
+                                        console.error("Unrecoverable error:", data.details);
+                                        playbackMode.textContent = 'Error';
+                                        playbackMode.classList.remove('bg-amber-800');
+                                        playbackMode.classList.add('bg-red-800');
+                                }
+                            } else if (data.details === 'bufferStalledError') {
+                                // Buffer stalled - transcode might be catching up
+                                console.log("Buffer stalled at", lastKnownTime.toFixed(2), 
+                                           "buffered to", lastKnownBuffered.toFixed(2));
+                                playbackMode.textContent = 'Buffering...';
+                            }
+                        });
+                        
+                        // Update status when buffering resolves
+                        video.addEventListener('playing', () => {
+                            if (playbackMode.textContent === 'Buffering...') {
+                                playbackMode.textContent = 'Transcoding';
+                            }
+                        });
+
+                        window.hls = hls;
+                    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                        // Safari native HLS
+                        video.src = playback.url;
+                        video.play().catch(e => console.log("Autoplay blocked:", e));
+                    }
+                }
+            } catch (error) {
+                console.error('Playback error:', error);
+                playbackMode.textContent = 'Fallback';
+                playbackMode.classList.add('bg-red-800');
+                // Fallback to old behavior
+                video.src = "/stream/" + id;
+                video.play().catch(e => console.log("Autoplay blocked:", e));
+            }
+        }
+
+        function closeVideo() {
+            const modal = document.getElementById('video-modal');
+            const video = document.getElementById('main-player');
+            const playbackMode = document.getElementById('playback-mode');
+            
+            video.pause();
+            if (window.hls) {
+                window.hls.destroy();
+                window.hls = null;
+            }
+            video.src = "";
+            modal.classList.add('hidden');
+            
+            // Reset playback mode indicator
+            playbackMode.textContent = '';
+            playbackMode.className = 'text-xs bg-zinc-800 text-zinc-300 px-2 py-1 rounded';
+        }
+
+        // Close on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeVideo();
+        });
+    </script>
+</body>
+</html>
