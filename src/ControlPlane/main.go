@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,7 +29,6 @@ func main() {
 	var jobQueue ports.JobQueue
 
 	runMode := os.Getenv("RUN_MODE")
-	cwd, _ := os.Getwd()
 
 	if runMode == "test" || runMode == "memory" {
 		log.Println("Running in MEMORY/TEST mode")
@@ -75,16 +72,12 @@ func main() {
 		log.Println("Exposing internal queue at /internal/queue/...")
 	}
 
-	// 3. Setup UI & API Handlers
-	tmplPath := filepath.Join(cwd, "src", "ControlPlane", "templates", "index.html")
-	if _, err := os.Stat(tmplPath); os.IsNotExist(err) {
-		tmplPath = filepath.Join(cwd, "templates", "index.html")
-	}
+	// 3. Setup API Handlers
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		tmpl, err := template.ParseFiles(tmplPath)
-		if err != nil {
-			http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
+	// List Media API
+	mux.HandleFunc("/api/v1/media", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
@@ -94,14 +87,31 @@ func main() {
 			return
 		}
 
-		data := map[string]interface{}{
-			"Time":             time.Now().Format(time.RFC3339),
-			"ContinueWatching": items,
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(items)
+	})
+
+	// Get Media API
+	mux.HandleFunc("/api/v1/media/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
 
-		if err := tmpl.Execute(w, data); err != nil {
-			log.Printf("Error executing template: %v", err)
+		id := strings.TrimPrefix(r.URL.Path, "/api/v1/media/")
+		if id == "" {
+			http.Error(w, "ID required", http.StatusBadRequest)
+			return
 		}
+
+		item, err := mediaRepo.GetByID(r.Context(), id)
+		if err != nil {
+			http.Error(w, "Media not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(item)
 	})
 
 	// HLS Segment/Manifest Server (Reverse Proxy to Worker)
