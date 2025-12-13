@@ -22,6 +22,7 @@ func NewHTTPServerQueue(queue ports.JobQueue) *HTTPServerQueue {
 func (h *HTTPServerQueue) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/internal/queue/dequeue", h.handleDequeue)
 	mux.HandleFunc("/internal/queue/update", h.handleUpdate)
+	mux.HandleFunc("/internal/queue/add_segment", h.handleAddSegment)
 }
 
 func (h *HTTPServerQueue) handleDequeue(w http.ResponseWriter, r *http.Request) {
@@ -48,13 +49,35 @@ func (h *HTTPServerQueue) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("[HTTP Queue] Worker %s started processing job %s", job.WorkerID, job.ID)
 		}
+		// Clear recovery flag when worker starts processing
+		job.RecoveryInProgress = false
 	} else if job.Status == "Ready" {
 		log.Printf("[HTTP Queue] Worker %s reports job %s is READY (Stream Active)", job.WorkerID, job.ID)
+		// Clear recovery flag when stream becomes ready
+		job.RecoveryInProgress = false
 	} else if job.Status == "Failed" {
 		log.Printf("[HTTP Queue] ❌ Worker %s reports job %s FAILED", job.WorkerID, job.ID)
+		job.RecoveryInProgress = false
 	}
 
 	if err := h.queue.UpdateJob(r.Context(), &job); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServerQueue) handleAddSegment(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		JobID   string         `json:"jobId"`
+		Segment domain.Segment `json:"segment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.queue.AddSegment(r.Context(), payload.JobID, payload.Segment); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

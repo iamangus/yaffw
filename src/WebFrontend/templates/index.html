@@ -308,19 +308,47 @@
                             console.log("HLS Manifest parsed:", data.levels.length, "levels");
                             video.play().catch(e => console.log("Autoplay blocked:", e));
                         });
+
+                        // Detailed Manifest Loading Logging
+                        hls.on(Hls.Events.MANIFEST_LOADED, function(event, data) {
+                             console.log("HLS Manifest Loaded. Details:", {
+                                 url: data.url,
+                                 levels: data.levels.length,
+                                 audioTracks: data.audioTracks.length,
+                                 stats: data.stats
+                             });
+                        });
                         
+                        hls.on(Hls.Events.LEVEL_UPDATED, function(event, data) {
+                            const details = data.details;
+                            console.log("HLS Level Updated. New details:", {
+                                level: data.level,
+                                fragments: details.fragments.length,
+                                startSN: details.startSN,
+                                endSN: details.endSN,
+                                totalDuration: details.totalduration,
+                                targetDuration: details.targetduration,
+                                live: details.live
+                            });
+                        });
+
                         // Log fragment loading for debugging
                         hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
-                            console.log("Fragment loaded:", data.frag.sn, 
-                                        "start:", data.frag.start.toFixed(2),
-                                        "duration:", data.frag.duration.toFixed(2));
+                            console.log("Fragment downloaded:", {
+                                sn: data.frag.sn,
+                                url: data.frag.relurl,
+                                duration: data.frag.duration,
+                                start: data.frag.start,
+                                size: data.stats.total
+                            });
                         });
                         
                         // Detect and handle discontinuities
                         hls.on(Hls.Events.FRAG_CHANGED, function(event, data) {
                             if (data.frag.discontinuity) {
-                                console.log("Crossed discontinuity at fragment:", data.frag.sn);
+                                console.warn("DISCONTINUITY DETECTED at fragment:", data.frag.sn, "CC:", data.frag.cc);
                             }
+                            console.log("Fragment playing:", data.frag.sn);
                         });
                         
                         hls.on(Hls.Events.LEVEL_LOADED, function(event, data) {

@@ -21,9 +21,9 @@ type MediaItem struct {
 }
 
 type TranscodeJob struct {
-	ID        string
-	MediaID   string
-	FilePath  string
+	ID            string
+	MediaID       string
+	FilePath      string
 	Status        string // Pending, Processing, Ready, Failed
 	WorkerID      string
 	WorkerAddress string // IP:Port of the worker serving the files
@@ -42,6 +42,25 @@ type TranscodeJob struct {
 	// Progress tracking for seamless resume
 	LastSegmentNum     int     // Last segment number written before crash
 	TranscodedDuration float64 // Total seconds transcoded so far
+
+	// JIT/Recovery Start Point (set by Control Plane)
+	StartSegment int     `json:"startSegment"`
+	StartTime    float64 `json:"startTime"`
+
+	// Recovery deduplication tracking
+	RecoveryInProgress bool      // Set to true when JIT recovery is triggered
+	LastRecoveryTime   time.Time // Timestamp of last recovery trigger
+
+	// V2: Segment Tracking for Ephemeral Workers
+	Segments []Segment
+}
+
+type Segment struct {
+	SequenceID int     `json:"seq"`
+	Duration   float64 `json:"dur"`
+	WorkerID   string  `json:"worker"` // Which worker produced this
+	WorkerAddr string  `json:"addr"`   // Address to fetch it from
+	Timestamp  float64 `json:"ts"`     // Start time of segment
 }
 
 // ClientCapabilities represents what the client browser can play

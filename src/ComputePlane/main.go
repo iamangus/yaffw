@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/yaffw/yaffw/src/internal/adapters/http_queue"
 	"github.com/yaffw/yaffw/src/internal/services"
@@ -21,7 +23,14 @@ func main() {
 	queueClient := http_queue.NewHTTPClientQueue(controlURL + "/internal/queue")
 
 	// 2. Start Worker
-	workerID := "compute-node-1"
+	// Use a unique ID per run to detect restarts/crashes in the Control Plane
+	// In a real K8s env, this would be the Pod Name.
+	hostname, _ := os.Hostname()
+	workerID := fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano())
+	if hostname == "" {
+		workerID = fmt.Sprintf("compute-node-%d", time.Now().UnixNano())
+	}
+	
 	worker := services.NewTranscodeWorker(queueClient, workerID)
 
 	// 3. Block

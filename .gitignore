@@ -10,6 +10,7 @@ bin/
 
 # Logs
 *.log
+logs/
 
 # Data and Media
 data/
@@ -24,3 +25,9 @@ temp/
 
 # Go
 vendor/
+
+# env
+.env
+
+# testapp
+test_app.sh

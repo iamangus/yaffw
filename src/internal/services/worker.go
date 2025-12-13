@@ -23,6 +23,7 @@ type TranscodeWorker struct {
 	workerID   string
 	ffmpegPath string
 	tempDir    string
+	logsDir    string
 }
 
 func NewTranscodeWorker(queue ports.JobQueue, id string) *TranscodeWorker {
@@ -34,11 +35,16 @@ func NewTranscodeWorker(queue ports.JobQueue, id string) *TranscodeWorker {
 	tempDir := filepath.Join(cwd, "temp", "transcode")
 	os.MkdirAll(tempDir, 0755)
 
+	// Create logs dir
+	logsDir := filepath.Join(cwd, "logs")
+	os.MkdirAll(logsDir, 0755)
+
 	return &TranscodeWorker{
 		queue:      queue,
 		workerID:   id,
 		ffmpegPath: ffmpegPath,
 		tempDir:    tempDir,
+		logsDir:    logsDir,
 	}
 }
 
@@ -55,32 +61,14 @@ func (w *TranscodeWorker) Start(ctx context.Context) {
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
-			// Handle Playlist
+			// Playlist requests should go through ControlPlane, not directly to worker
 			if strings.HasSuffix(r.URL.Path, ".m3u8") {
-				// Path: /job-id/stream.m3u8
-				parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
-				if len(parts) >= 1 {
-					jobID := parts[0]
-					jobDir := filepath.Join(w.tempDir, jobID)
-
-					// OPTIMIZATION: Check if we can serve the FFmpeg playlist directly
-					// If it starts with Sequence 0, it's a complete playlist (no crash recovery needed yet)
-					playlistPath := filepath.Join(jobDir, "stream.m3u8")
-					content, err := os.ReadFile(playlistPath)
-					if err == nil {
-						if strings.Contains(string(content), "#EXT-X-MEDIA-SEQUENCE:0") {
-							// Fast path: Serve directly
-							rw.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-							rw.Write(content)
-							return
-						}
-					}
-
-					ServeDynamicPlaylist(rw, jobID, jobDir)
-					return
-				}
+				http.Error(rw, "Playlist requests must go through ControlPlane at /hls/{job-id}/stream.m3u8", http.StatusBadRequest)
+				log.Printf("[Worker %s] Rejected direct playlist request: %s (should use ControlPlane)", w.workerID, r.URL.Path)
+				return
 			}
-			// Default file server
+			// Default file server for segment files (.ts)
+			log.Printf("[Worker %s] Serving file request: %s", w.workerID, r.URL.Path)
 			http.FileServer(http.Dir(w.tempDir)).ServeHTTP(rw, r)
 		})
 
@@ -154,7 +142,7 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 	defer hbCancel() // Safety fallback
 
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(1 * time.Second) // Fast Heartbeat (1s)
 		defer ticker.Stop()
 		for {
 			select {
@@ -169,14 +157,22 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 		}
 	}()
 
-	// Calculate resume point based on actual transcoded content
+	// Calculate resume point
 	startSegment := 0
 	startTime := 0.0
-	if job.RestartCount > 0 {
+
+	// Priority 1: Explicit start point from Control Plane (JIT/Ephemeral Recovery)
+	if job.StartSegment > 0 {
+		startSegment = job.StartSegment
+		startTime = job.StartTime
+		log.Printf("[Worker %s] JIT START: Starting job %s at segment %d (time: %.2fs) as requested by Control Plane.",
+			w.workerID, job.ID, startSegment, startTime)
+	} else if job.RestartCount > 0 {
+		// Priority 2: Local recovery (if files exist on this node)
 		// Analyze existing segments to determine actual progress
 		startSegment, startTime = w.analyzeExistingSegments(jobDir)
 		if startSegment > 0 {
-			log.Printf("[Worker %s] RECOVERY: Resuming job %s from segment %d (time: %.2fs). Previous segments found.",
+			log.Printf("[Worker %s] LOCAL RECOVERY: Resuming job %s from segment %d (time: %.2fs). Previous segments found.",
 				w.workerID, job.ID, startSegment, startTime)
 
 			// Update job with progress info
@@ -184,7 +180,6 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 			job.TranscodedDuration = startTime
 
 			// Hard Reset Strategy: Delete the old playlist.
-			// Our dynamic playlist generator will recreate it properly.
 			os.Remove(outputPath)
 		}
 	}
@@ -194,7 +189,7 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 	cmd := exec.Command(w.ffmpegPath, args...)
 
 	// Redirect logs to file for debugging
-	logFile, err := os.Create(filepath.Join(jobDir, "ffmpeg.log"))
+	logFile, err := os.Create(filepath.Join(w.logsDir, fmt.Sprintf("ffmpeg-%s.log", job.ID)))
 	if err == nil {
 		cmd.Stderr = logFile
 		cmd.Stdout = logFile
@@ -241,10 +236,14 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 		log.Printf("[Worker %s] Job %s Ready. Stream started. (FFmpeg PID %d)", w.workerID, job.ID, cmd.Process.Pid)
 	}
 
+	// Start Segment Watcher AFTER FFmpeg is ready and we know the start segment
+	// Pass startSegment so the watcher only reports segments this worker creates
+	go w.watchSegments(hbCtx, job.ID, jobDir, startSegment)
+
 	// Wait for completion (blocking this goroutine to keep heartbeats alive)
 	err = cmd.Wait()
-	hbCancel() // Stop heartbeats only after FFmpeg finishes
-	
+	hbCancel() // Stop heartbeats and watcher only after FFmpeg finishes
+
 	if err != nil {
 		log.Printf("[Worker %s] Job %s FFmpeg finished with error: %v", w.workerID, job.ID, err)
 	} else {
@@ -288,7 +287,7 @@ func (w *TranscodeWorker) analyzeExistingSegments(jobDir string) (nextSegment in
 	for i := len(segments) - 1; i >= 0; i-- {
 		seg := segments[i]
 		_, duration, err := w.probeSegment(seg.Path)
-		
+
 		if err != nil {
 			log.Printf("[Worker %s] RECOVERY: Found corrupt segment %s (Error: %v). Deleting...", w.workerID, seg.Path, err)
 			os.Remove(seg.Path)
@@ -333,7 +332,7 @@ func (w *TranscodeWorker) analyzeExistingSegments(jobDir string) (nextSegment in
 		log.Printf("[Worker %s] RECOVERY: Failed to probe last segment %s: %v. Fallback to 0.", w.workerID, lastSeg.Path, err)
 		return 0, 0.0
 	}
-	
+
 	totalDuration = startTimeVal + duration
 
 	// Next segment is one after the highest numbered segment
@@ -466,4 +465,80 @@ func (w *TranscodeWorker) buildFFmpegArgs(job *domain.TranscodeJob, jobDir, outp
 		w.workerID, videoCodec, audioCodec, startSegment, startTime)
 
 	return args
+}
+
+func (w *TranscodeWorker) watchSegments(ctx context.Context, jobID, jobDir string, startSegment int) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	reportedSegments := make(map[int]bool)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			files, err := filepath.Glob(filepath.Join(jobDir, "segment_*.ts"))
+			if err != nil {
+				continue
+			}
+
+			for _, f := range files {
+				base := filepath.Base(f)
+				numStr := strings.TrimSuffix(strings.TrimPrefix(base, "segment_"), ".ts")
+				num, err := strconv.Atoi(numStr)
+				if err != nil {
+					continue
+				}
+
+				if reportedSegments[num] {
+					continue
+				}
+
+				// CRITICAL: Only report segments that this worker is responsible for
+				// If we're recovering from segment N onwards, don't report segments < N
+				// as they belong to the previous (dead) worker
+				if num < startSegment {
+					log.Printf("[Worker %s] Skipping segment %d (belongs to previous worker, this worker starts at %d)",
+						w.workerID, num, startSegment)
+					reportedSegments[num] = true // Mark as reported to avoid repeated logs
+					continue
+				}
+
+				// Probe to get duration and start time
+				startTime, duration, err := w.probeSegment(f)
+				if err != nil {
+					// Might be incomplete file, skip for now
+					continue
+				}
+
+				// Report to Control Plane
+				seg := domain.Segment{
+					SequenceID: num,
+					Duration:   duration,
+					WorkerID:   w.workerID,
+					WorkerAddr: fmt.Sprintf("http://%s:%s", os.Getenv("WORKER_IP"), os.Getenv("WORKER_PORT")),
+					Timestamp:  startTime,
+				}
+
+				// Fix address if env vars missing
+				if seg.WorkerAddr == "http://:" {
+					seg.WorkerAddr = "http://127.0.0.1:8080"
+				}
+
+				if err := w.queue.AddSegment(context.Background(), jobID, seg); err != nil {
+					log.Printf("[Worker %s] Failed to report segment %d: %v", w.workerID, num, err)
+				} else {
+					fileInfo, _ := os.Stat(f)
+					size := int64(0)
+					if fileInfo != nil {
+						size = fileInfo.Size()
+					}
+					log.Printf("[Worker %s] SEGMENT FOUND: %d (Dur: %.2fs, Start: %.2fs, Size: %d bytes). Reported to Control Plane.",
+						w.workerID, num, duration, startTime, size)
+					reportedSegments[num] = true
+				}
+			}
+		}
+	}
 }
