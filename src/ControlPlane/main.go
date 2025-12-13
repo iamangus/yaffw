@@ -9,11 +9,14 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/yaffw/yaffw/src/internal/adapters/http_queue"
 	"github.com/yaffw/yaffw/src/internal/adapters/memory"
+	"github.com/yaffw/yaffw/src/internal/adapters/postgres"
 	"github.com/yaffw/yaffw/src/internal/domain"
 	"github.com/yaffw/yaffw/src/internal/ports"
 	"github.com/yaffw/yaffw/src/internal/services"
@@ -28,49 +31,52 @@ func main() {
 	var mediaRepo ports.MediaRepository
 	var jobQueue ports.JobQueue
 
-	runMode := os.Getenv("RUN_MODE")
+	log.Println("Running in PRODUCTION mode")
+	// Use memory repo for media for now (todo: implement postgres media repo)
+	mediaRepo = memory.NewMediaRepo()
 
-	if runMode == "test" || runMode == "memory" {
-		log.Println("Running in MEMORY/TEST mode")
-		repo := memory.NewMediaRepo()
-		mediaRepo = repo
+	// Initialize Postgres Job Queue
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		// Default for dev/docker
+		connStr = "postgres://user:password@localhost:5432/yaffw?sslmode=disable"
+		log.Printf("No DATABASE_URL set, using default: %s", connStr)
+	}
 
-		// Initialize In-Memory Job Queue (Master Source of Truth)
-		queue := memory.NewJobQueue()
-		jobQueue = queue
+	pq, err := postgres.NewJobQueue(connStr)
+	if err != nil {
+		log.Fatalf("Failed to connect to Postgres Queue: %v", err)
+	}
+	jobQueue = pq
+	log.Println("Connected to Postgres Job Queue")
 
-		// Seed data from 'data' directory
-		scanner := services.NewLibraryScanner(repo)
-		dataDir := os.Getenv("DATA_DIR")
-		if dataDir == "" {
-			dataDir = "data"
-		}
+	// Seed data from 'data' directory
+	scanner := services.NewLibraryScanner(mediaRepo)
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "data"
+	}
 
-		log.Printf("Scanning media from: %s", dataDir)
-		if err := scanner.ScanDirectory(context.Background(), dataDir); err != nil {
-			log.Printf("Warning: Failed to scan directory: %v", err)
-		}
-	} else {
-		log.Println("Running in PRODUCTION mode (Postgres pending implementation)")
-		mediaRepo = memory.NewMediaRepo()
-		jobQueue = memory.NewJobQueue()
+	log.Printf("Scanning media from: %s", dataDir)
+	if err := scanner.ScanDirectory(context.Background(), dataDir); err != nil {
+		log.Printf("Warning: Failed to scan directory: %v", err)
 	}
 
 	// Initialize Playback Service
+
 	ffmpegPath := "ffmpeg"
 	playbackSvc = services.NewPlaybackService(mediaRepo, ffmpegPath)
 
-	// Start Job Reaper
-	reaper := services.NewJobReaper(jobQueue)
-	go reaper.StartMonitoring(context.Background())
+	// Start Passive Recovery Monitor (JIT-Aware Reaper)
+	go startPassiveRecoveryMonitor(context.Background(), jobQueue)
 
-	// 2. Expose Queue via HTTP (Mock Redis)
+	// 2. Expose Queue via HTTP
+	// We expose this in ALL modes now, so Workers can always connect via HTTP
+	// (Even in Prod, avoiding DB creds in workers)
 	mux := http.NewServeMux()
-	if runMode == "test" || runMode == "memory" {
-		queueServer := http_queue.NewHTTPServerQueue(jobQueue)
-		queueServer.RegisterHandlers(mux)
-		log.Println("Exposing internal queue at /internal/queue/...")
-	}
+	queueServer := http_queue.NewHTTPServerQueue(jobQueue)
+	queueServer.RegisterHandlers(mux)
+	log.Println("Exposing internal queue at /internal/queue/...")
 
 	// 3. Setup API Handlers
 
@@ -114,37 +120,116 @@ func main() {
 		json.NewEncoder(w).Encode(item)
 	})
 
-	// HLS Segment/Manifest Server (Reverse Proxy to Worker)
+	// HLS Segment/Manifest Server (Smart Proxy & Playlist Generator)
 	mux.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Path is now "job-ID/stream.m3u8" or "job-ID/segment_001.ts"
 		parts := strings.Split(r.URL.Path, "/")
-		if len(parts) < 1 {
+		if len(parts) < 2 {
 			http.Error(w, "Invalid path", http.StatusBadRequest)
 			return
 		}
 		jobID := parts[0]
+		filename := parts[1]
 
-		// 1. Get Job to find Worker Address
+		// 1. Get Job
 		job, err := jobQueue.GetJob(r.Context(), jobID)
 		if err != nil {
 			http.Error(w, "Job not found", http.StatusNotFound)
 			return
 		}
 
-		if job.WorkerAddress == "" {
-			http.Error(w, "Worker address not found for job", http.StatusBadGateway)
+		// 2. Handle Playlist
+		if strings.HasSuffix(filename, ".m3u8") {
+			serveDynamicPlaylist(w, job)
 			return
 		}
 
-		// 2. Proxy Request
-		targetURL, err := url.Parse(job.WorkerAddress)
-		if err != nil {
-			http.Error(w, "Invalid worker address", http.StatusInternalServerError)
+		// 3. Handle Segments (Smart Proxy)
+		if strings.HasSuffix(filename, ".ts") {
+			// Parse segment number: segment_001.ts -> 1
+			numStr := strings.TrimSuffix(strings.TrimPrefix(filename, "segment_"), ".ts")
+			segNum, err := strconv.Atoi(numStr)
+			if err != nil {
+				http.Error(w, "Invalid segment name", http.StatusBadRequest)
+				return
+			}
+
+			// Find segment in job state
+			var targetSegment *domain.Segment
+			for _, s := range job.Segments {
+				if s.SequenceID == segNum {
+					targetSegment = &s
+					break
+				}
+			}
+
+			if targetSegment != nil {
+				// Segment exists! Proxy to the worker that owns it.
+				targetURL, err := url.Parse(targetSegment.WorkerAddr)
+				if err != nil {
+					http.Error(w, "Invalid worker address", http.StatusInternalServerError)
+					return
+				}
+
+				log.Printf("[Proxy] Forwarding request for segment %d to worker %s (%s)", segNum, targetSegment.WorkerID, targetURL)
+
+				proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+				// Handle Proxy Errors (Worker Dead/Unreachable)
+				proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+					log.Printf("[Proxy] Failed to proxy segment %d to %s (Worker: %s): %v", segNum, targetURL, targetSegment.WorkerID, err)
+
+					// 1. Mark worker as dead (remove its segments)
+					lastKnownSeg, err := jobQueue.MarkWorkerAsDead(r.Context(), jobID, targetSegment.WorkerID)
+					if err != nil {
+						log.Printf("Failed to mark worker as dead: %v", err)
+					}
+
+					// 2. Trigger JIT Recovery (Smart Forward Recovery)
+					// If the requested segment is much older than the last known segment,
+					// we should resume from the end to keep the stream alive, rather than rewinding.
+
+					recoveryStartSeg := segNum
+					if lastKnownSeg > segNum {
+						log.Printf("[Recovery] Requested segment %d is older than last known segment %d. Resuming from end to prevent rewind.", segNum, lastKnownSeg)
+						recoveryStartSeg = lastKnownSeg + 1
+					}
+
+					startTime := float64(recoveryStartSeg) * 4.0
+					if err := triggerJITRecovery(r.Context(), jobQueue, job, recoveryStartSeg, startTime); err != nil {
+						log.Printf("Failed to trigger recovery: %v", err)
+					}
+
+					// 3. Return 503 to client
+					w.Header().Set("Retry-After", "2")
+					http.Error(w, "Worker unreachable, recovering...", http.StatusServiceUnavailable)
+				}
+
+				proxy.ServeHTTP(w, r)
+				return
+			}
+
+			// Segment MISSING! Trigger JIT Re-transcode.
+			log.Printf("[Control] Segment %d missing for job %s. Triggering JIT Re-transcode.", segNum, jobID)
+
+			// Calculate start time for this segment
+			startTime := calculateStartTime(job, segNum)
+
+			// Trigger recovery
+			if err := triggerJITRecovery(r.Context(), jobQueue, job, segNum, startTime); err != nil {
+				log.Printf("Failed to trigger recovery: %v", err)
+				http.Error(w, "Recovery failed", http.StatusInternalServerError)
+				return
+			}
+
+			// Return 503 Service Unavailable with Retry-After header
+			// The client should retry, by which time the new worker might be ready.
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "Segment regenerating...", http.StatusServiceUnavailable)
 			return
 		}
 
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-		proxy.ServeHTTP(w, r)
+		http.Error(w, "Not found", http.StatusNotFound)
 	})))
 
 	// Smart Playback API
@@ -330,12 +415,12 @@ func handleHLS(w http.ResponseWriter, r *http.Request, repo ports.MediaRepositor
 		job = newJob
 	}
 
-	// Poll Status
+	// Poll Status (Wait for at least one segment or Ready status)
 	timeout := time.After(30 * time.Second)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for job.Status != "Ready" {
+	for job.Status != "Ready" && len(job.Segments) == 0 {
 		select {
 		case <-timeout:
 			http.Error(w, "Transcode timeout - Is Compute Plane running?", http.StatusGatewayTimeout)
@@ -350,4 +435,215 @@ func handleHLS(w http.ResponseWriter, r *http.Request, repo ports.MediaRepositor
 
 	log.Printf("Job Ready! Redirecting to %s", job.StreamURL)
 	http.Redirect(w, r, job.StreamURL, http.StatusFound)
+}
+
+func serveDynamicPlaylist(w http.ResponseWriter, job *domain.TranscodeJob) {
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+
+	// Sort segments by SequenceID to ensure correct ordering
+	// This is critical when segments from multiple workers are mixed
+	sortedSegments := make([]domain.Segment, len(job.Segments))
+	copy(sortedSegments, job.Segments)
+	sort.Slice(sortedSegments, func(i, j int) bool {
+		return sortedSegments[i].SequenceID < sortedSegments[j].SequenceID
+	})
+
+	// Calculate max duration for TARGETDURATION
+	maxDuration := 5.0
+	for _, seg := range sortedSegments {
+		if seg.Duration > maxDuration {
+			maxDuration = seg.Duration
+		}
+	}
+
+	// Basic HLS Header
+	fmt.Fprintf(w, "#EXTM3U\n")
+	fmt.Fprintf(w, "#EXT-X-VERSION:6\n") // Version 6 for better discontinuity support
+	fmt.Fprintf(w, "#EXT-X-TARGETDURATION:%d\n", int(maxDuration)+1)
+	firstSeqID := 0
+	if len(sortedSegments) > 0 {
+		firstSeqID = sortedSegments[0].SequenceID
+	}
+	fmt.Fprintf(w, "#EXT-X-MEDIA-SEQUENCE:%d\n", firstSeqID)
+	fmt.Fprintf(w, "#EXT-X-PLAYLIST-TYPE:EVENT\n")
+	fmt.Fprintf(w, "#EXT-X-INDEPENDENT-SEGMENTS\n") // Each segment can be decoded independently
+
+	// List all known segments with discontinuity markers
+	var lastWorkerID string
+	discontinuityCount := 0
+	for i, seg := range sortedSegments {
+		// Check for discontinuity (Worker changed)
+		if i > 0 && seg.WorkerID != lastWorkerID && lastWorkerID != "" {
+			fmt.Fprintf(w, "#EXT-X-DISCONTINUITY\n")
+			log.Printf("[Playlist] Discontinuity #%d injected between segment %d (worker %s) and segment %d (worker %s)",
+				discontinuityCount+1, sortedSegments[i-1].SequenceID, lastWorkerID, seg.SequenceID, seg.WorkerID)
+			discontinuityCount++
+		}
+		lastWorkerID = seg.WorkerID
+
+		fmt.Fprintf(w, "#EXTINF:%.6f,\n", seg.Duration)
+		fmt.Fprintf(w, "segment_%03d.ts\n", seg.SequenceID)
+	}
+
+	// If job is done (not implemented yet), add ENDLIST.
+	// For now, we assume it's always live/growing until we have a "Completed" status.
+	if job.Status == "Completed" { // We don't have this status yet
+		fmt.Fprintf(w, "#EXT-X-ENDLIST\n")
+	}
+
+	log.Printf("[Playlist] Generated dynamic playlist for job %s: %d segments (Range: %d-%d), Discontinuities: %d",
+		job.ID, len(sortedSegments),
+		func() int {
+			if len(sortedSegments) > 0 {
+				return sortedSegments[0].SequenceID
+			}
+			return 0
+		}(),
+		func() int {
+			if len(sortedSegments) > 0 {
+				return sortedSegments[len(sortedSegments)-1].SequenceID
+			}
+			return 0
+		}(),
+		discontinuityCount)
+}
+
+func calculateStartTime(job *domain.TranscodeJob, startSeg int) float64 {
+	// Try to find the immediately preceding segment
+	for _, s := range job.Segments {
+		if s.SequenceID == startSeg-1 {
+			return s.Timestamp + s.Duration
+		}
+	}
+
+	// Fallback: Iterate to find the highest sequence ID < startSeg
+	var bestSeg *domain.Segment
+	for i := range job.Segments {
+		s := &job.Segments[i]
+		if s.SequenceID < startSeg {
+			if bestSeg == nil || s.SequenceID > bestSeg.SequenceID {
+				bestSeg = s
+			}
+		}
+	}
+
+	if bestSeg != nil {
+		// Estimate forward from the best segment we have
+		// Assuming 4s for missing segments in between (if any)
+		missingCount := startSeg - bestSeg.SequenceID - 1
+		return bestSeg.Timestamp + bestSeg.Duration + float64(missingCount)*4.0
+	}
+
+	// Total fallback
+	return float64(startSeg) * 4.0
+}
+
+func triggerJITRecovery(ctx context.Context, queue ports.JobQueue, job *domain.TranscodeJob, startSeg int, startTime float64) error {
+	// Deduplication: Check if recovery is already in progress
+	// Prevents "recovery storms" where multiple missing segments trigger multiple recovery attempts
+	if job.RecoveryInProgress {
+		timeSinceLastRecovery := time.Since(job.LastRecoveryTime)
+		if timeSinceLastRecovery < 5*time.Second {
+			log.Printf("[Recovery] SKIPPED: Recovery already in progress for job %s (triggered %.1fs ago)",
+				job.ID, timeSinceLastRecovery.Seconds())
+			return nil
+		}
+		// If it's been more than 5 seconds, the previous recovery might have failed, allow retry
+		log.Printf("[Recovery] Previous recovery timeout (%.1fs ago), allowing new recovery attempt",
+			timeSinceLastRecovery.Seconds())
+	}
+
+	// Purge any stale pending tasks for this job from the queue to prevent workers
+	// from picking up obsolete recovery instructions (e.g. recovering an older segment)
+	if err := queue.PurgeJobs(ctx, job.ID); err != nil {
+		log.Printf("[Recovery] Warning: Failed to purge stale jobs for %s: %v", job.ID, err)
+	}
+
+	// 1. Mark job as recovering/pending
+	job.Status = "Pending"
+	job.RestartCount++
+	job.StartSegment = startSeg
+	job.StartTime = startTime
+	job.RecoveryInProgress = true
+	job.LastRecoveryTime = time.Now()
+
+	// 2. Enqueue it again (Compute Plane will pick it up)
+	// Note: In a real system, we might need to explicitly kill the old worker if it's still running but stuck.
+	// Here, we assume the old worker is dead or we just start a new one.
+	// The queue implementation handles deduplication or updates.
+
+	log.Printf("[Control] Re-queuing job %s for JIT recovery at segment %d", job.ID, startSeg)
+	return queue.Enqueue(ctx, job)
+}
+
+// startPassiveRecoveryMonitor checks for dead jobs and triggers JIT recovery
+// This replaces the old "Reaper" service with a smarter, state-aware recovery mechanism.
+func startPassiveRecoveryMonitor(ctx context.Context, queue ports.JobQueue) {
+	log.Println("Starting Passive Recovery Monitor (JIT-Aware)...")
+	ticker := time.NewTicker(1 * time.Second) // Check every second for fast recovery
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			jobs, err := queue.ListActiveJobs(ctx)
+			if err != nil {
+				log.Printf("Recovery Monitor failed to list jobs: %v", err)
+				continue
+			}
+
+			now := time.Now()
+			threshold := 3 * time.Second // Fast Recovery: Allow 3 missed heartbeats (3s)
+
+			for _, job := range jobs {
+				if !job.LastHeartbeat.IsZero() && now.Sub(job.LastHeartbeat) > threshold {
+					log.Printf("[Recovery] ⚠️ DETECTED DEAD WORKER (ID: %s) for Job %s. Last heartbeat: %s ago.",
+						job.WorkerID, job.ID, now.Sub(job.LastHeartbeat))
+
+					// CRITICAL: Mark the dead worker's segments as invalid
+					// This prevents the proxy from trying to serve them from the dead worker
+					// and ensures discontinuity markers are properly placed
+					lastKnownSeg, err := queue.MarkWorkerAsDead(ctx, job.ID, job.WorkerID)
+					if err != nil {
+						log.Printf("[Recovery] Failed to mark worker %s as dead: %v", job.WorkerID, err)
+					} else {
+						log.Printf("[Recovery] Marked worker %s as dead, removed its segments from job %s",
+							job.WorkerID, job.ID)
+					}
+
+					// Determine resume point from last reported segment
+					startSeg := 0
+					startTime := 0.0
+
+					// Use lastKnownSeg from MarkWorkerAsDead if available, otherwise use job.LastSegmentNum
+					if lastKnownSeg > 0 {
+						startSeg = lastKnownSeg + 1
+						log.Printf("[Recovery] Found existing segments (Last: %d). Resuming from Segment %d",
+							lastKnownSeg, startSeg)
+					} else if job.LastSegmentNum > 0 {
+						startSeg = job.LastSegmentNum + 1
+						log.Printf("[Recovery] Using LastSegmentNum: %d. Resuming from Segment %d",
+							job.LastSegmentNum, startSeg)
+					} else {
+						log.Printf("[Recovery] No existing segments found. Restarting from beginning.")
+					}
+
+					// Estimate start time based on segment number or use TranscodedDuration if available
+					if job.TranscodedDuration > 0 {
+						startTime = job.TranscodedDuration
+					} else {
+						startTime = calculateStartTime(job, startSeg)
+					}
+
+					// Trigger JIT Recovery
+					if err := triggerJITRecovery(ctx, queue, job, startSeg, startTime); err != nil {
+						log.Printf("[Recovery] CRITICAL: Failed to recover job %s: %v", job.ID, err)
+					}
+				}
+			}
+		}
+	}
 }

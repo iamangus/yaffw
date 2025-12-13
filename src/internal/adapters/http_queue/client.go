@@ -80,6 +80,39 @@ func (q *HTTPClientQueue) UpdateJob(ctx context.Context, job *domain.TranscodeJo
 	return nil
 }
 
+func (q *HTTPClientQueue) AddSegment(ctx context.Context, jobID string, segment domain.Segment) error {
+	payload := struct {
+		JobID   string         `json:"jobId"`
+		Segment domain.Segment `json:"segment"`
+	}{
+		JobID:   jobID,
+		Segment: segment,
+	}
+
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, "POST", q.baseURL+"/add_segment", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := q.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to add segment: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (q *HTTPClientQueue) MarkWorkerAsDead(ctx context.Context, jobID string, workerID string) (int, error) {
+	return 0, errors.New("not implemented for client")
+}
+
+func (q *HTTPClientQueue) PurgeJobs(ctx context.Context, jobID string) error {
+	return errors.New("not implemented for client")
+}
+
 func (q *HTTPClientQueue) ListActiveJobs(ctx context.Context) ([]*domain.TranscodeJob, error) {
 	// Not used by worker
 	return nil, errors.New("not implemented")
