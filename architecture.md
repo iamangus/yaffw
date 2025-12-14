@@ -4,7 +4,7 @@ This document outlines the architectural design for a distributed, cloud-native 
 
 ## 1. System Overview
 
-The system is designed to run on Kubernetes. It moves away from local filesystem locks and SQLite in favor of PostgreSQL for data, Redis for state coordination, and Ephemeral Microservices for video processing.
+The system is designed to run on Kubernetes. It moves away from local filesystem locks and SQLite in favor of PostgreSQL for data and state coordination, and Ephemeral Microservices for video processing.
 
 ### High-Level Topology
 
@@ -26,7 +26,6 @@ graph TD
 
     subgraph "Data Persistence Layer"
         PG[(PostgreSQL)]
-        Redis[(Redis Cluster)]
         S3[(Object Storage - Images/Metadata)]
         PVC[(Read-Only Media PVC)]
     end
@@ -34,15 +33,14 @@ graph TD
     Traffic --> LB
     LB --> API
     API --> PG
-    API --> Redis
     API --> S3
     API -- Read --> PVC
 
-    Redis -- Enqueue Job --> KEDA
+    PG -- Queue Count --> KEDA
     KEDA -- Scale --> Worker
-    Worker -- Pop Job --> Redis
+    Worker -- Dequeue (HTTP) --> API
     Worker -- Read --> PVC
-    Worker -- Update Status --> Redis
+    Worker -- Update Status (HTTP) --> API
     API -- Stream Proxy Request --> Worker
     Worker -- Serve Segments --> API
 ```
@@ -56,8 +54,8 @@ The API layer is responsible for user management, library browsing, metadata sca
 *   **Technology**: Go (Golang) / `html/template` + HTMX + Tailwind CSS.
 *   **State Strategy**: Stateless. No local config files. Configuration is injected via K8s ConfigMaps/Secrets.
 *   **Database Interaction**: Uses `pgx` or standard `database/sql` with PostgreSQL.
-*   **Authentication**: JWT Tokens passed via HTTP Headers; invalidation lists stored in Redis.
-*   **Real-time Comms**: SSE (Server-Sent Events) with Redis Pub/Sub. Ensures notifications (e.g., "User B started watching X") are broadcast to all API replicas.
+*   **Authentication**: JWT Tokens passed via HTTP Headers; invalidation lists stored in PostgreSQL.
+*   **Real-time Comms**: Client Polling (HTMX). Ensures notifications (e.g., "User B started watching X") are broadcast to all API replicas.
 *   **Scaling**: Horizontal Pod Autoscaler (HPA) based on CPU/Memory usage.
 
 ### 2.2. The Compute Plane (Transcode Workers)
@@ -69,16 +67,12 @@ A specialized fleet of pods dedicated solely to running FFmpeg.
     *   **Media Volume (ReadOnly)**: Direct access to source media files (NFS/CephFS).
     *   **Ephemeral scratch space**: `emptyDir` (RAM Disk) to store HLS segments (`.ts`) and manifests (`.m3u8`).
 *   **Network**: Runs a lightweight HTTP server to serve the generated HLS segments internally.
-*   **Scaling**: KEDA (Kubernetes Event-driven Autoscaling). Scales from 0 to N based on the length of the Redis `transcode_jobs` queue.
+*   **Scaling**: KEDA (Kubernetes Event-driven Autoscaling). Scales from 0 to N based on the length of the Postgres `transcode_jobs` table.
 *   **Hardware**: Pods utilize Kubernetes Device Plugins to request GPU resources (nvidia.com/gpu, intel.com/gpu).
 
 ### 2.3. Data & State Layer
 
-*   **PostgreSQL**: Stores Users, Library Hierarchy, Watch Status, Plugin Configurations, and Metadata.
-*   **Redis**:
-    *   **Session Store**: Distributed user sessions.
-    *   **Job Queue**: Transcoding tasks and Library Scan tasks.
-    *   **Service Discovery**: Maps `SessionID` -> `Worker_Internal_IP` (e.g., `session_123` is handled by `10.42.0.5`).
+*   **PostgreSQL**: Stores Users, Library Hierarchy, Watch Status, Plugin Configurations, Metadata, Job Queue, and Worker State (Service Discovery).
 *   **Object Storage (MinIO/S3)**: Stores images (posters, backdrops, actor photos). Removes the need for a shared configuration volume for images.
 
 ## 3. Detailed Workflows
@@ -101,20 +95,20 @@ The user requires transcoding due to incompatible codecs or bitrate limits.
 2.  **Decision**: API Pod A determines transcoding is needed.
 3.  **Queuing**:
     *   API Pod A generates a `JobPayload` (Source Path, Target Codec, Bitrate, StartTime).
-    *   Pushes payload to Redis List `queue:transcode`.
-    *   Subscribes to Redis Channel `events:session_123` to await worker readiness.
+    *   Inserts payload to Postgres table `transcode_jobs`.
+    *   Polls Postgres for worker readiness.
 4.  **Scaling**: KEDA detects 1 item in the queue and scales **Worker Deployment** from 0 -> 1.
 5.  **Processing**:
-    *   **Worker Pod 1** starts, pops the job.
+    *   **Worker Pod 1** starts, requests job from Control Plane.
     *   Starts FFmpeg process.
     *   FFmpeg writes `segment_0.ts` to local RAM disk.
     *   Worker Pod 1 starts internal HTTP server on port 8080.
-    *   Worker Pod 1 publishes "Ready" event to Redis and sets key `map:session_123 = 10.42.5.5:8080`.
+    *   Worker Pod 1 updates status to "Ready" via Control Plane (updates Postgres) and sets worker address `10.42.5.5:8080`.
 6.  **Streaming**:
-    *   API Pod A receives "Ready" signal.
+    *   API Pod A detects "Ready" signal.
     *   API Pod A acts as a **Reverse Proxy**.
     *   API fetches `http://10.42.5.5:8080/stream.m3u8` and forwards to User.
-7.  **Failover**: If User requests segment 5, and the Load Balancer routes them to **API Pod B**, Pod B simply looks up `map:session_123` in Redis, finds the Worker IP, and proxies the stream. The user session is sticky to the stream, not the API pod.
+7.  **Failover**: If User requests segment 5, and the Load Balancer routes them to **API Pod B**, Pod B simply looks up `worker_address` in Postgres, finds the Worker IP, and proxies the stream. The user session is sticky to the stream, not the API pod.
 
 ## 4. Database Schema Design (Migration from SQLite)
 
@@ -140,7 +134,7 @@ The move to Postgres requires a schema refactor to ensure referential integrity 
     *   Replicas: 0 (Managed by KEDA).
     *   Tolerations: `gpu-node=true`.
     *   VolumeMounts: `/media` (ReadOnly).
-*   **Service (Internal)**: ClusterIP for API and Redis.
+*   **Service (Internal)**: ClusterIP for API and PostgreSQL.
 *   **Service (Headless)**: For Worker discovery (optional, if not using direct IP lookup).
 
 ## 6. Benefits over Legacy Architecture
@@ -159,6 +153,6 @@ The move to Postgres requires a schema refactor to ensure referential integrity 
 *   **Network Latency**: Proxying streams from Worker -> API -> User adds hops.
     *   *Mitigation*: Keep API and Workers in the same zone/cluster. Use gRPC for stream transport if HTTP/1.1 is too slow.
 *   **Orphaned Workers**: If an API pod crashes before killing a transcode job, the worker might run forever.
-    *   *Mitigation*: Workers implement a "Lease" system. If they don't receive a "Keep-Alive" ping from the API every 30 seconds via Redis, they self-terminate.
+    *   *Mitigation*: Workers implement a heartbeat and status check system. If they don't receive a valid job status from the API every few seconds (or if the job is deleted), they self-terminate.
 *   **Database Migration**: Moving users from SQLite to Postgres.
     *   *Mitigation*: Develop a robust ETL tool (Extract-Transform-Load) to migrate `library.db` data to the Postgres schema before first launch.

@@ -11,6 +11,17 @@ type MediaRepository interface {
 	Save(ctx context.Context, item *domain.MediaItem) error
 }
 
+type UserRepository interface {
+	GetByID(ctx context.Context, id string) (*domain.User, error)
+	Save(ctx context.Context, user *domain.User) error
+}
+
+type HistoryRepository interface {
+	GetProgress(ctx context.Context, userID, mediaID string) (*domain.WatchProgress, error)
+	SaveProgress(ctx context.Context, progress *domain.WatchProgress) error
+	ListContinueWatching(ctx context.Context, userID string) ([]domain.MediaItem, error)
+}
+
 type JobQueue interface {
 	Enqueue(ctx context.Context, job *domain.TranscodeJob) error
 	Dequeue(ctx context.Context) (*domain.TranscodeJob, error)

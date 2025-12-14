@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -14,10 +13,14 @@ import (
 )
 
 type MediaItem struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Path      string `json:"path"`
-	PosterURL string `json:"posterUrl,omitempty"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Path         string `json:"path"`
+	PosterURL    string `json:"posterUrl,omitempty"`
+	ViewProgress *struct {
+		Position float64 `json:"position"`
+		Finished bool    `json:"finished"`
+	} `json:"viewProgress,omitempty"`
 }
 
 func main() {
@@ -34,14 +37,19 @@ func main() {
 	}
 
 	cwd, _ := os.Getwd()
-	// Try to find the template in likely locations
 	tmplPath := filepath.Join(cwd, "src", "WebFrontend", "templates", "index.html")
 	if _, err := os.Stat(tmplPath); os.IsNotExist(err) {
-		// Fallback if running from src/WebFrontend or similar
 		tmplPath = "templates/index.html"
 	}
 
+	authSvc := NewAuthService()
+
 	mux := http.NewServeMux()
+
+	// Auth Routes
+	mux.HandleFunc("/auth/login", authSvc.HandleLogin)
+	mux.HandleFunc("/auth/callback", authSvc.HandleCallback)
+	mux.HandleFunc("/auth/logout", authSvc.HandleLogout)
 
 	// 1. Home Page
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -50,24 +58,45 @@ func main() {
 			return
 		}
 
-		// Fetch media from Control Plane
-		// Note: We are using the new API endpoint defined in the separation plan
+		// Check Auth
+		cookie, err := r.Cookie("yaffw_token")
+		loggedIn := (err == nil && cookie.Value != "")
+
+		// 1. Fetch Library (All Media)
+		// TODO: This should probably be paginated or just a list of IDs for large libraries
+		log.Printf("Frontend: Fetching media from %s/api/v1/media", cpURL)
 		resp, err := http.Get(cpURL + "/api/v1/media")
 		if err != nil {
-			http.Error(w, "Failed to fetch media from Control Plane: "+err.Error(), http.StatusBadGateway)
+			log.Printf("Frontend: Failed to fetch media: %v", err)
+			http.Error(w, "Failed to fetch media: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, fmt.Sprintf("Control Plane returned %d", resp.StatusCode), http.StatusBadGateway)
-			return
+		var library []MediaItem
+		if err := json.NewDecoder(resp.Body).Decode(&library); err != nil {
+			log.Printf("Frontend: Failed to decode library: %v", err)
+		} else {
+			log.Printf("Frontend: Successfully fetched %d items", len(library))
 		}
 
-		var items []MediaItem
-		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
-			http.Error(w, "Failed to decode media list: "+err.Error(), http.StatusInternalServerError)
-			return
+		// 2. Fetch Continue Watching (Personal) if logged in
+		var continueWatching []MediaItem
+		if loggedIn {
+			req, _ := http.NewRequest("GET", cpURL+"/api/v1/continue-watching", nil)
+			req.Header.Set("Authorization", "Bearer "+cookie.Value)
+
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				json.NewDecoder(resp.Body).Decode(&continueWatching)
+				resp.Body.Close()
+			} else {
+				log.Printf("Failed to fetch continue watching: %v", err)
+			}
+		} else {
+			// If not logged in, maybe show random items or nothing?
+			// For now, let's just show nothing in Continue Watching to encourage login.
 		}
 
 		tmpl, err := template.ParseFiles(tmplPath)
@@ -78,7 +107,9 @@ func main() {
 
 		data := map[string]interface{}{
 			"Time":             time.Now().Format(time.RFC3339),
-			"ContinueWatching": items,
+			"ContinueWatching": continueWatching,
+			"Library":          library,
+			"LoggedIn":         loggedIn,
 		}
 
 		if err := tmpl.Execute(w, data); err != nil {
@@ -99,10 +130,10 @@ func main() {
 		req.Host = target.Host
 	}
 
-	// Proxy API, Stream, and HLS endpoints
-	mux.Handle("/api/", proxy)
-	mux.Handle("/stream/", proxy)
-	mux.Handle("/hls/", proxy)
+	// Proxy with Token Injection
+	mux.Handle("/api/", authSvc.TokenMiddleware(proxy))
+	mux.Handle("/stream/", authSvc.TokenMiddleware(proxy))
+	mux.Handle("/hls/", authSvc.TokenMiddleware(proxy))
 
 	// 3. Client Logging
 	mux.HandleFunc("/client-log", func(w http.ResponseWriter, r *http.Request) {

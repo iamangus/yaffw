@@ -3,7 +3,7 @@
 ## Architecture Context
 - **Backend**: Go (Golang) for ALL services (Control & Compute Planes).
 - **Frontend**: HTML, HTMX, Tailwind CSS, Franken-UI.
-- **Data**: Postgres (Data), Redis (State/Queue).
+- **Data**: Postgres (Data/State/Queue).
 - **Note**: This stack overrides any .NET references in `architecture.md`.
 
 881M    ./Watcher (2022)

@@ -18,6 +18,9 @@ type MediaItem struct {
 	PosterURL string
 	Duration  time.Duration
 	CreatedAt time.Time
+
+	// User-specific fields (populated on demand)
+	ViewProgress *WatchProgress `json:"viewProgress,omitempty"`
 }
 
 type TranscodeJob struct {

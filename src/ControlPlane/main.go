@@ -52,6 +52,20 @@ func main() {
 	}
 	mediaRepo = pgMediaRepo
 
+	// Initialize Postgres User & History Repos
+	pgUserRepo := postgres.NewUserRepo(db)
+	if err := pgUserRepo.InitSchema(); err != nil {
+		log.Fatalf("Failed to init user schema: %v", err)
+	}
+
+	pgHistoryRepo := postgres.NewHistoryRepo(db)
+	if err := pgHistoryRepo.InitSchema(); err != nil {
+		log.Fatalf("Failed to init history schema: %v", err)
+	}
+
+	// Auth Middleware
+	authMW := NewAuthMiddleware(pgUserRepo)
+
 	// Initialize Postgres Job Queue
 	pgJobQueue := postgres.NewJobQueue(db)
 	if err := pgJobQueue.InitSchema(); err != nil {
@@ -107,6 +121,8 @@ func main() {
 			return
 		}
 
+		log.Printf("[API] ListAll returning %d items", len(items))
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(items)
 	})
@@ -133,6 +149,47 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(item)
 	})
+
+	// Continue Watching API (Authenticated)
+	mux.HandleFunc("/api/v1/continue-watching", authMW.RequireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		userID := GetUserID(r.Context())
+		items, err := pgHistoryRepo.ListContinueWatching(r.Context(), userID)
+		if err != nil {
+			log.Printf("Failed to list continue watching: %v", err)
+			http.Error(w, "DB Error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(items)
+	}))
+
+	// Save Progress API (Authenticated)
+	mux.HandleFunc("/api/v1/progress", authMW.RequireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var p domain.WatchProgress
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		p.UserID = GetUserID(r.Context())
+		p.UpdatedAt = time.Now()
+
+		if err := pgHistoryRepo.SaveProgress(r.Context(), &p); err != nil {
+			log.Printf("Failed to save progress: %v", err)
+			http.Error(w, "Failed to save", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
 
 	// HLS Segment/Manifest Server (Smart Proxy & Playlist Generator)
 	mux.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

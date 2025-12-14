@@ -93,7 +93,12 @@
                     <button class="p-2 text-zinc-400 hover:text-white">
                         <i data-lucide="bell" class="w-5 h-5"></i>
                     </button>
-                    <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-primary to-secondary"></div>
+                    {{if .LoggedIn}}
+                        <a href="/auth/logout" class="text-sm font-medium text-zinc-400 hover:text-white">Logout</a>
+                        <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-primary to-secondary"></div>
+                    {{else}}
+                        <a href="/auth/login" class="bg-primary hover:bg-primary/90 text-white px-4 py-2 rounded-md text-sm font-medium transition">Login</a>
+                    {{end}}
                 </div>
             </div>
         </div>
@@ -102,6 +107,7 @@
     <!-- Main Content -->
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <!-- Hero / Continue Watching -->
+        {{if .ContinueWatching}}
         <section class="mb-12">
             <h2 class="text-2xl font-bold mb-6 flex items-center gap-2">
                 <i data-lucide="play-circle" class="w-6 h-6 text-primary"></i>
@@ -110,7 +116,7 @@
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {{range .ContinueWatching}}
                 <!-- Card -->
-                <div onclick="playVideo('{{.ID}}')" class="group relative aspect-video bg-zinc-900 rounded-lg overflow-hidden border border-zinc-800 hover:border-zinc-700 transition-all cursor-pointer">
+                <div onclick="playVideo('{{.ID}}', {{if .ViewProgress}}{{.ViewProgress.Position}}{{else}}0{{end}})" class="group relative aspect-video bg-zinc-900 rounded-lg overflow-hidden border border-zinc-800 hover:border-zinc-700 transition-all cursor-pointer">
                     <div class="absolute inset-0 flex items-center justify-center text-zinc-700">
                         {{if .PosterURL}}
                         <img src="{{.PosterURL}}" class="w-full h-full object-cover opacity-50 group-hover:opacity-75 transition" alt="{{.Title}}">
@@ -127,26 +133,34 @@
                     <div class="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent flex flex-col justify-end p-4">
                         <h3 class="font-bold text-lg">{{.Title}}</h3>
                         <div class="w-full bg-zinc-800 h-1 rounded-full mt-2 overflow-hidden">
-                            <div class="bg-primary h-full" style="width: 45%"></div>
+                             <!-- TODO: Calculate width properly based on Duration vs Position -->
+                            <div class="bg-primary h-full" style="width: 50%"></div>
                         </div>
                     </div>
                 </div>
                 {{end}}
             </div>
         </section>
+        {{end}}
 
         <!-- Libraries -->
         <section>
-            <h2 class="text-2xl font-bold mb-6">My Media</h2>
-            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                <div class="bg-zinc-900 aspect-[2/3] rounded-lg border border-zinc-800 flex flex-col items-center justify-center hover:bg-zinc-800 transition cursor-pointer">
-                    <i data-lucide="film" class="w-8 h-8 text-zinc-600 mb-2"></i>
-                    <span class="font-medium text-sm">Movies</span>
+            <h2 class="text-2xl font-bold mb-6">Library</h2>
+             <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
+                {{range .Library}}
+                <div onclick="playVideo('{{.ID}}', 0)" class="group relative aspect-[2/3] bg-zinc-900 rounded-lg overflow-hidden border border-zinc-800 hover:border-zinc-700 transition cursor-pointer">
+                    {{if .PosterURL}}
+                    <img src="{{.PosterURL}}" class="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition" alt="{{.Title}}">
+                    {{else}}
+                    <div class="w-full h-full flex flex-col items-center justify-center text-zinc-700">
+                        <i data-lucide="film" class="w-8 h-8 mb-2"></i>
+                    </div>
+                    {{end}}
+                     <div class="absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition flex flex-col justify-end p-3">
+                        <h3 class="font-bold text-sm text-white">{{.Title}}</h3>
+                    </div>
                 </div>
-                <div class="bg-zinc-900 aspect-[2/3] rounded-lg border border-zinc-800 flex flex-col items-center justify-center hover:bg-zinc-800 transition cursor-pointer">
-                     <i data-lucide="tv" class="w-8 h-8 text-zinc-600 mb-2"></i>
-                    <span class="font-medium text-sm">TV Shows</span>
-                </div>
+                {{end}}
             </div>
         </section>
         
@@ -180,24 +194,25 @@
         // Detect client capabilities on load
         const clientCapabilities = detectCapabilities();
         let currentMediaId = null;
+        let progressInterval = null;
         
         function detectCapabilities() {
             const caps = {
                 // Video codecs
-                h264: MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"') || 
-                      MediaSource.isTypeSupported('video/mp4; codecs="avc1.4D401E"') ||
-                      MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001E"'),
-                h265: MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
-                      MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.B0"'),
-                vp9: MediaSource.isTypeSupported('video/webm; codecs="vp9"') ||
-                     MediaSource.isTypeSupported('video/mp4; codecs="vp09.00.10.08"'),
-                av1: MediaSource.isTypeSupported('video/mp4; codecs="av01.0.01M.08"'),
+                h264: (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"')) || 
+                      (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.4D401E"')) ||
+                      (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001E"')),
+                h265: (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"')) ||
+                      (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.B0"')),
+                vp9: (window.MediaSource && MediaSource.isTypeSupported('video/webm; codecs="vp9"')) ||
+                     (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="vp09.00.10.08"')),
+                av1: (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="av01.0.01M.08"')),
                 
                 // Audio codecs
-                aac: MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"'),
-                ac3: MediaSource.isTypeSupported('audio/mp4; codecs="ac-3"'),
-                eac3: MediaSource.isTypeSupported('audio/mp4; codecs="ec-3"'),
-                opus: MediaSource.isTypeSupported('audio/webm; codecs="opus"'),
+                aac: (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"')),
+                ac3: (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="ac-3"')),
+                eac3: (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="ec-3"')),
+                opus: (window.MediaSource && MediaSource.isTypeSupported('audio/webm; codecs="opus"')),
                 
                 // Containers
                 hls: Hls.isSupported() || document.createElement('video').canPlayType('application/vnd.apple.mpegurl') !== '',
@@ -220,14 +235,14 @@
             if (caps.ac3) supported.push('AC3');
             if (caps.eac3) supported.push('E-AC3');
             
-            document.getElementById('capabilities-info').textContent = 
-                'Client Codecs: ' + supported.join(', ');
+            const infoEl = document.getElementById('capabilities-info');
+            if (infoEl) infoEl.textContent = 'Client Codecs: ' + supported.join(', ');
             
             console.log('Detected Capabilities:', caps);
             return caps;
         }
 
-        async function playVideo(id) {
+        async function playVideo(id, startTime = 0) {
             currentMediaId = id;
             const modal = document.getElementById('video-modal');
             const video = document.getElementById('main-player');
@@ -235,6 +250,27 @@
 
             modal.classList.remove('hidden');
             playbackMode.textContent = 'Checking...';
+            
+            // Start Heartbeat
+            if (progressInterval) clearInterval(progressInterval);
+            progressInterval = setInterval(() => {
+                if (!video.paused && !video.ended && video.currentTime > 0) {
+                    fetch('/api/v1/progress', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            mediaId: id, // Note: lowercase 'd' in JSON struct on server? No, server expects JSON matching struct.
+                            // Go struct: MediaID, Position, Finished. JSON decoder is case-insensitive by default? 
+                            // Standard Go JSON uses struct field names if no tag, or tag.
+                            // Let's check struct tags in domain/user.go: No tags!
+                            // So it expects "MediaID", "Position", "Finished".
+                            MediaID: id,
+                            Position: video.currentTime,
+                            Finished: (video.duration > 0 && (video.currentTime / video.duration) > 0.9)
+                        })
+                    }).catch(e => console.log("Progress update failed (likely not logged in)", e));
+                }
+            }, 10000);
 
             try {
                 // Call smart playback API
@@ -261,6 +297,7 @@
                     playbackMode.classList.add('bg-emerald-800');
                     
                     video.src = playback.url;
+                    video.currentTime = startTime; // Resume
                     video.play().catch(e => console.log("Autoplay blocked:", e));
                 } else {
                     // Transcode via HLS
@@ -270,25 +307,18 @@
                     
                     if (Hls.isSupported()) {
                         const hls = new Hls({
-                            // Aggressive playlist refresh for live transcoding
+                            // ... existing config ...
                             levelLoadingMaxRetry: 10,
                             manifestLoadingMaxRetry: 10,
                             fragLoadingMaxRetry: 10,
                             levelLoadingRetryDelay: 500,
                             fragLoadingRetryDelay: 500,
-                            
-                            // Keep buffer small to handle discontinuities better
                             maxBufferLength: 30,
                             maxMaxBufferLength: 60,
                             
-                            // Start from beginning, not live edge
-                            startPosition: 0,
+                            startPosition: startTime, // Resume HLS
                             liveSyncDuration: 0,
-                            
-                            // Enable worker for better performance
                             enableWorker: true,
-                            
-                            // Low latency settings for live transcoding
                             backBufferLength: 30,
                         });
                         
@@ -413,6 +443,7 @@
         }
 
         function closeVideo() {
+            if (progressInterval) clearInterval(progressInterval);
             const modal = document.getElementById('video-modal');
             const video = document.getElementById('main-player');
             const playbackMode = document.getElementById('playback-mode');

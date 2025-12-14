@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,9 +35,11 @@ func (s *LibraryScanner) ScanDirectory(ctx context.Context, root string) error {
 
 		if isVideoFile(path) {
 			item := mapFileToMediaItem(root, path, info)
+			log.Printf("[Scanner] Found video: %s (ID: %s)", item.Title, item.ID)
 			if err := s.repo.Save(ctx, &item); err != nil {
 				return fmt.Errorf("failed to save item %s: %w", item.Title, err)
 			}
+			log.Printf("[Scanner] Saved item: %s", item.Title)
 		}
 		return nil
 	})

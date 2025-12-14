@@ -9,7 +9,7 @@ The system is split into two main components: the **Control Plane** and the **Co
 ### Control Plane (`src/ControlPlane/main.go`)
 The Control Plane is the brain of the operation. It handles:
 - **API Requests**: Serves the frontend and client API calls.
-- **Job Management**: Maintains the `JobQueue` (currently in-memory) as the single source of truth.
+- **Job Management**: Maintains the `JobQueue` (backed by PostgreSQL) as the single source of truth.
 - **HLS Orchestration**: Generates dynamic HLS playlists (`.m3u8`) and proxies segment requests (`.ts`) to the appropriate workers.
 - **Failure Detection**: Runs a `PassiveRecoveryMonitor` to monitor worker health and trigger JIT recovery.
 
@@ -101,7 +101,7 @@ When a worker starts a job, it checks if it can resume work locally (useful if t
 
 | Feature | Component | Function/Method | Description |
 |---------|-----------|-----------------|-------------|
-| **Job Queue** | Shared | `Enqueue`, `Dequeue` | In-memory queue operations (mocking Redis). |
+| **Job Queue** | Shared | `Enqueue`, `Dequeue` | PostgreSQL queue operations (SKIP LOCKED). |
 | **Passive Monitor** | Control | `startPassiveRecoveryMonitor` | Monitors heartbeats and triggers JIT recovery. |
 | **Smart Proxy** | Control | `main` (HLS Handler) | Proxies segments; triggers recovery on failure. |
 | **JIT Trigger** | Control | `triggerJITRecovery` | Configures a job to restart at a specific segment. |
