@@ -1,0 +1,2 @@
+control_url: "http://localhost:8000"
+worker_port: "8001"

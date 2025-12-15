@@ -4,11 +4,11 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/yaffw/yaffw/src/internal/config"
 	"github.com/yaffw/yaffw/src/internal/domain"
 	"github.com/yaffw/yaffw/src/internal/ports"
 )
@@ -18,15 +18,14 @@ type AuthMiddleware struct {
 	UserRepo ports.UserRepository
 }
 
-func NewAuthMiddleware(userRepo ports.UserRepository) *AuthMiddleware {
-	providerURL := os.Getenv("OIDC_PROVIDER")
-	if providerURL == "" {
-		log.Println("WARNING: OIDC_PROVIDER not set. Auth will be disabled (or broken if required).")
+func NewAuthMiddleware(userRepo ports.UserRepository, oidcCfg config.OIDCConfig) *AuthMiddleware {
+	if oidcCfg.ProviderURL == "" {
+		log.Println("WARNING: OIDC Provider URL not set. Auth will be disabled (or broken if required).")
 		return &AuthMiddleware{UserRepo: userRepo}
 	}
 
 	ctx := context.Background()
-	provider, err := oidc.NewProvider(ctx, providerURL)
+	provider, err := oidc.NewProvider(ctx, oidcCfg.ProviderURL)
 	if err != nil {
 		// Don't crash, just log error and fail later if auth is used
 		log.Printf("Failed to query OIDC provider: %v", err)
@@ -35,7 +34,7 @@ func NewAuthMiddleware(userRepo ports.UserRepository) *AuthMiddleware {
 
 	// For Access Tokens, we often need to skip ClientID check as 'aud' might not match client_id
 	oidcConfig := &oidc.Config{
-		ClientID:          os.Getenv("OIDC_CLIENT_ID"),
+		ClientID:          oidcCfg.ClientID,
 		SkipClientIDCheck: true,
 	}
 	verifier := provider.Verifier(oidcConfig)

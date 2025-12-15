@@ -1,0 +1,7 @@
+control_plane_url: "http://localhost:8096"
+port: "8080"
+oidc:
+  provider_url: "https://accounts.google.com"
+  client_id: "YOUR_CLIENT_ID"
+  client_secret: "YOUR_CLIENT_SECRET"
+  redirect_url: "http://localhost:8080/auth/callback"

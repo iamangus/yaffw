@@ -4,9 +4,9 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/yaffw/yaffw/src/internal/config"
 	"golang.org/x/oauth2"
 )
 
@@ -16,27 +16,22 @@ type AuthService struct {
 	Enabled  bool
 }
 
-func NewAuthService() *AuthService {
-	providerURL := os.Getenv("OIDC_PROVIDER")
-	clientID := os.Getenv("OIDC_CLIENT_ID")
-	clientSecret := os.Getenv("OIDC_CLIENT_SECRET")
-	redirectURL := os.Getenv("OIDC_REDIRECT_URL")
-
-	if providerURL == "" {
-		log.Println("OIDC_PROVIDER not set. Frontend Auth disabled.")
+func NewAuthService(oidcCfg config.OIDCConfig) *AuthService {
+	if oidcCfg.ProviderURL == "" {
+		log.Println("OIDC Provider URL not set. Frontend Auth disabled.")
 		return &AuthService{Enabled: false}
 	}
 
-	provider, err := oidc.NewProvider(context.Background(), providerURL)
+	provider, err := oidc.NewProvider(context.Background(), oidcCfg.ProviderURL)
 	if err != nil {
 		log.Printf("Failed to init OIDC provider: %v", err)
 		return &AuthService{Enabled: false}
 	}
 
 	conf := oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		RedirectURL:  redirectURL,
+		ClientID:     oidcCfg.ClientID,
+		ClientSecret: oidcCfg.ClientSecret,
+		RedirectURL:  oidcCfg.RedirectURL,
 		Endpoint:     provider.Endpoint(),
 		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 	}

@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/yaffw/yaffw/src/internal/config"
 )
 
 type MediaItem struct {
@@ -26,14 +28,29 @@ type MediaItem struct {
 func main() {
 	log.Println("Starting yaffw Web Frontend...")
 
-	cpURL := os.Getenv("CONTROL_PLANE_URL")
-	if cpURL == "" {
-		cpURL = "http://localhost:8096"
+	// Load Config
+	configFile := "config.yaml"
+	if len(os.Args) > 1 {
+		configFile = os.Args[1]
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	var cfg config.WebFrontendConfig
+	if err := config.Load(configFile, &cfg); err != nil {
+		log.Printf("Warning: Failed to load config '%s': %v. Using defaults/env.", configFile, err)
+		cfg.ControlPlaneURL = os.Getenv("CONTROL_PLANE_URL")
+		if cfg.ControlPlaneURL == "" {
+			cfg.ControlPlaneURL = "http://localhost:8096"
+		}
+		cfg.Port = os.Getenv("PORT")
+		if cfg.Port == "" {
+			cfg.Port = "8080"
+		}
+		cfg.OIDC.ProviderURL = os.Getenv("OIDC_PROVIDER")
+		cfg.OIDC.ClientID = os.Getenv("OIDC_CLIENT_ID")
+		cfg.OIDC.ClientSecret = os.Getenv("OIDC_CLIENT_SECRET")
+		cfg.OIDC.RedirectURL = os.Getenv("OIDC_REDIRECT_URL")
+	} else {
+		log.Printf("Loaded config from %s", configFile)
 	}
 
 	cwd, _ := os.Getwd()
@@ -42,7 +59,7 @@ func main() {
 		tmplPath = "templates/index.html"
 	}
 
-	authSvc := NewAuthService()
+	authSvc := NewAuthService(cfg.OIDC)
 
 	mux := http.NewServeMux()
 
@@ -64,8 +81,8 @@ func main() {
 
 		// 1. Fetch Library (All Media)
 		// TODO: This should probably be paginated or just a list of IDs for large libraries
-		log.Printf("Frontend: Fetching media from %s/api/v1/media", cpURL)
-		resp, err := http.Get(cpURL + "/api/v1/media")
+		log.Printf("Frontend: Fetching media from %s/api/v1/media", cfg.ControlPlaneURL)
+		resp, err := http.Get(cfg.ControlPlaneURL + "/api/v1/media")
 		if err != nil {
 			log.Printf("Frontend: Failed to fetch media: %v", err)
 			http.Error(w, "Failed to fetch media: "+err.Error(), http.StatusBadGateway)
@@ -83,7 +100,7 @@ func main() {
 		// 2. Fetch Continue Watching (Personal) if logged in
 		var continueWatching []MediaItem
 		if loggedIn {
-			req, _ := http.NewRequest("GET", cpURL+"/api/v1/continue-watching", nil)
+			req, _ := http.NewRequest("GET", cfg.ControlPlaneURL+"/api/v1/continue-watching", nil)
 			req.Header.Set("Authorization", "Bearer "+cookie.Value)
 
 			client := &http.Client{Timeout: 5 * time.Second}
@@ -118,7 +135,7 @@ func main() {
 	})
 
 	// 2. Proxy API requests to Control Plane
-	target, err := url.Parse(cpURL)
+	target, err := url.Parse(cfg.ControlPlaneURL)
 	if err != nil {
 		log.Fatal("Invalid CONTROL_PLANE_URL: ", err)
 	}
@@ -134,6 +151,7 @@ func main() {
 	mux.Handle("/api/", authSvc.TokenMiddleware(proxy))
 	mux.Handle("/stream/", authSvc.TokenMiddleware(proxy))
 	mux.Handle("/hls/", authSvc.TokenMiddleware(proxy))
+	mux.Handle("/artwork/", authSvc.TokenMiddleware(proxy)) // New artwork proxy
 
 	// 3. Client Logging
 	mux.HandleFunc("/client-log", func(w http.ResponseWriter, r *http.Request) {
@@ -146,8 +164,8 @@ func main() {
 		}
 	})
 
-	log.Printf("Web Frontend listening on http://0.0.0.0:%s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("Web Frontend listening on http://0.0.0.0:%s", cfg.Port)
+	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -10,6 +10,27 @@ const (
 	MediaTypeSeries  MediaType = "Series"
 )
 
+type MetadataStatus string
+
+const (
+	MetadataStatusNew        MetadataStatus = "New"
+	MetadataStatusPending    MetadataStatus = "Pending"
+	MetadataStatusProcessing MetadataStatus = "Processing"
+	MetadataStatusReady      MetadataStatus = "Ready"
+	MetadataStatusFailed     MetadataStatus = "Failed"
+)
+
+type MediaMetadata struct {
+	Title       string    `json:"title"`
+	Overview    string    `json:"overview"`
+	ReleaseDate time.Time `json:"releaseDate"`
+	Rating      float64   `json:"rating"` // 0-10
+	Genres      []string  `json:"genres"`
+	BackdropURL string    `json:"backdropUrl"`
+	PosterImage string    `json:"posterImage"` // Temporary holder for remote URL
+	OriginalID  string    `json:"originalId"`  // e.g. TMDB ID
+}
+
 type MediaItem struct {
 	ID        string
 	Path      string
@@ -19,8 +40,19 @@ type MediaItem struct {
 	Duration  time.Duration
 	CreatedAt time.Time
 
+	// Metadata
+	MetadataStatus MetadataStatus `json:"metadataStatus"`
+	Metadata       *MediaMetadata `json:"metadata,omitempty"`
+
 	// User-specific fields (populated on demand)
 	ViewProgress *WatchProgress `json:"viewProgress,omitempty"`
+}
+
+type MetadataJob struct {
+	ID        string
+	MediaID   string
+	Status    string // Pending, Processing, Completed, Failed
+	CreatedAt time.Time
 }
 
 type TranscodeJob struct {
