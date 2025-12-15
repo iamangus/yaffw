@@ -1,0 +1,5 @@
+database_url: "postgres://user:password@localhost:5432/yaffw?sslmode=disable"
+data_dir: "./data"
+port: "8096"
+tmdb_api_key: "YOUR_TMDB_API_KEY"
+artwork_dir: "./artwork"

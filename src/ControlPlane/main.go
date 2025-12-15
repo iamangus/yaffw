@@ -15,7 +15,10 @@ import (
 	"time"
 
 	"github.com/yaffw/yaffw/src/internal/adapters/http_queue"
+	"github.com/yaffw/yaffw/src/internal/adapters/metadata/tmdb"
 	"github.com/yaffw/yaffw/src/internal/adapters/postgres"
+	"github.com/yaffw/yaffw/src/internal/adapters/storage"
+	"github.com/yaffw/yaffw/src/internal/config"
 	"github.com/yaffw/yaffw/src/internal/domain"
 	"github.com/yaffw/yaffw/src/internal/ports"
 	"github.com/yaffw/yaffw/src/internal/services"
@@ -26,6 +29,41 @@ var playbackSvc *services.PlaybackService
 func main() {
 	log.Println("Starting yaffw Control Plane...")
 
+	// Load Configuration
+	configFile := "config.yaml"
+	if len(os.Args) > 1 {
+		configFile = os.Args[1]
+	}
+
+	var cfg config.ControlPlaneConfig
+	if err := config.Load(configFile, &cfg); err != nil {
+		log.Printf("Warning: Could not load config file '%s': %v", configFile, err)
+		log.Println("Falling back to Environment Variables / Defaults...")
+
+		// Fallback logic for backward compatibility / env var usage
+		cfg.DatabaseURL = os.Getenv("DATABASE_URL")
+		if cfg.DatabaseURL == "" {
+			cfg.DatabaseURL = "postgres://user:password@localhost:5432/yaffw?sslmode=disable"
+		}
+		cfg.DataDir = os.Getenv("DATA_DIR")
+		if cfg.DataDir == "" {
+			cfg.DataDir = "data"
+		}
+		cfg.Port = os.Getenv("PORT")
+		if cfg.Port == "" {
+			cfg.Port = "8096"
+		}
+		cfg.TMDBAPIKey = os.Getenv("TMDB_API_KEY")
+		cfg.ArtworkDir = os.Getenv("ARTWORK_DIR")
+		if cfg.ArtworkDir == "" {
+			cfg.ArtworkDir = "./artwork"
+		}
+		cfg.OIDC.ProviderURL = os.Getenv("OIDC_PROVIDER")
+		cfg.OIDC.ClientID = os.Getenv("OIDC_CLIENT_ID")
+	} else {
+		log.Printf("Loaded configuration from %s", configFile)
+	}
+
 	// 1. Initialize Adapters
 	var mediaRepo ports.MediaRepository
 	var jobQueue ports.JobQueue
@@ -33,14 +71,7 @@ func main() {
 	log.Println("Running in PRODUCTION mode")
 
 	// Connect to Postgres
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		// Default for dev/docker
-		connStr = "postgres://user:password@localhost:5432/yaffw?sslmode=disable"
-		log.Printf("No DATABASE_URL set, using default: %s", connStr)
-	}
-
-	db, err := postgres.NewConnection(connStr)
+	db, err := postgres.NewConnection(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
@@ -64,7 +95,7 @@ func main() {
 	}
 
 	// Auth Middleware
-	authMW := NewAuthMiddleware(pgUserRepo)
+	authMW := NewAuthMiddleware(pgUserRepo, cfg.OIDC)
 
 	// Initialize Postgres Job Queue
 	pgJobQueue := postgres.NewJobQueue(db)
@@ -73,22 +104,44 @@ func main() {
 	}
 	jobQueue = pgJobQueue
 
-	log.Println("Connected to Postgres (MediaRepo + JobQueue)")
-
-	// Seed data from 'data' directory
-	scanner := services.NewLibraryScanner(mediaRepo)
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "data"
+	// Initialize Metadata Components
+	pgMetadataQueue := postgres.NewMetadataQueue(db)
+	if err := pgMetadataQueue.InitSchema(); err != nil {
+		log.Fatalf("Failed to init metadata queue schema: %v", err)
 	}
 
-	log.Printf("Scanning media from: %s", dataDir)
-	if err := scanner.ScanDirectory(context.Background(), dataDir); err != nil {
-		log.Printf("Warning: Failed to scan directory: %v", err)
+	pgLockManager := postgres.NewLockManager(db)
+	if err := pgLockManager.InitSchema(); err != nil {
+		log.Fatalf("Failed to init lock manager schema: %v", err)
 	}
+
+	// TMDB Client
+	if cfg.TMDBAPIKey == "" {
+		log.Println("Warning: tmdb_api_key not set. Metadata fetching will fail.")
+	}
+	tmdbClient := tmdb.NewTMDBClient(cfg.TMDBAPIKey)
+
+	// Filesystem Image Store (NFS)
+	imageStore, err := storage.NewFilesystemImageStore(cfg.ArtworkDir)
+	if err != nil {
+		log.Fatalf("Failed to init image store: %v", err)
+	}
+
+	log.Println("Connected to Postgres (MediaRepo + JobQueue + MetadataQueue)")
+
+	// 2. Start Services
+
+	// A. Scanner Service (Producer) - Runs as Daemon with Leader Election
+	scanner := services.NewLibraryScanner(mediaRepo, pgMetadataQueue, pgLockManager)
+
+	// Start Scanner in background
+	go scanner.StartDaemon(context.Background(), cfg.DataDir, 30*time.Second)
+
+	// B. Metadata Service (Consumer) - Runs as Workers
+	metaSvc := services.NewMetadataService(mediaRepo, pgMetadataQueue, tmdbClient, imageStore, 3)
+	metaSvc.StartWorkers(context.Background())
 
 	// Initialize Playback Service
-
 	ffmpegPath := "ffmpeg"
 	playbackSvc = services.NewPlaybackService(mediaRepo, ffmpegPath)
 
@@ -98,7 +151,7 @@ func main() {
 	// Start Session Watchdog (Cleans up idle jobs)
 	go startSessionWatchdog(context.Background(), jobQueue)
 
-	// 2. Expose Queue via HTTP
+	// 3. Expose Queue via HTTP
 	// We expose this in ALL modes now, so Workers can always connect via HTTP
 	// (Even in Prod, avoiding DB creds in workers)
 	mux := http.NewServeMux()
@@ -106,7 +159,11 @@ func main() {
 	queueServer.RegisterHandlers(mux)
 	log.Println("Exposing internal queue at /internal/queue/...")
 
-	// 3. Setup API Handlers
+	// 4. Setup API Handlers
+
+	// Artwork Server (NFS)
+	// Serves files from /artwork/ path mapping to ARTWORK_DIR
+	mux.Handle("/artwork/", http.StripPrefix("/artwork/", http.FileServer(http.Dir(cfg.ArtworkDir))))
 
 	// List Media API
 	mux.HandleFunc("/api/v1/media", func(w http.ResponseWriter, r *http.Request) {
@@ -369,13 +426,8 @@ func main() {
 		}
 	})
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8096"
-	}
-
-	log.Printf("Control Plane listening on http://0.0.0.0:%s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("Control Plane listening on http://0.0.0.0:%s", cfg.Port)
+	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -36,3 +36,28 @@ type JobQueue interface {
 	// Management
 	ListActiveJobs(ctx context.Context) ([]*domain.TranscodeJob, error)
 }
+
+type MetadataProvider interface {
+	Search(ctx context.Context, title string, year int, mediaType domain.MediaType) ([]domain.MediaMetadata, error)
+	GetDetails(ctx context.Context, remoteID string, mediaType domain.MediaType) (*domain.MediaMetadata, error)
+}
+
+type MetadataQueue interface {
+	Enqueue(ctx context.Context, job *domain.MetadataJob) error
+	Dequeue(ctx context.Context) (*domain.MetadataJob, error)
+	MarkCompleted(ctx context.Context, jobID string) error
+	MarkFailed(ctx context.Context, jobID string, reason string) error
+}
+
+type LockManager interface {
+	// TryAcquireLock attempts to acquire a distributed lock.
+	// Returns true if acquired, false if taken by another pod.
+	TryAcquireLock(ctx context.Context, key string, ttlSeconds int) (bool, error)
+	ReleaseLock(ctx context.Context, key string) error
+}
+
+type ImageStore interface {
+	// Save downloads image from remoteURL and saves to storage (NFS)
+	// Returns the public/relative URL (e.g. "/artwork/movie.jpg")
+	Save(ctx context.Context, remoteURL string, filename string) (string, error)
+}

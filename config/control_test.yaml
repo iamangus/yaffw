@@ -1,0 +1,8 @@
+database_url: "postgres://yaffw:yaffw@postgresql.system-database.svc.cluster.local:5432/yaffw?sslmode=disable"
+data_dir: "./data"
+port: "8000"
+tmdb_api_key: "603b3d5b9e211d94564ecf9d857cd522"
+artwork_dir: "./artwork"
+oidc:
+  provider_url: "https://auth.srvd.dev/auth/realms/master"
+  client_id: "devapp"
