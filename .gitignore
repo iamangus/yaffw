@@ -32,3 +32,13 @@ artwork/
 
 # testapp
 test_app.sh
+
+# Local plans/docs
+plans/
+
+# Compiled binaries
+/ControlPlane
+/ComputePlane
+/WebFrontend
+/src/ControlPlane/ControlPlane
+/src/ComputePlane/ComputePlane

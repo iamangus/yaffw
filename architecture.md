@@ -28,6 +28,7 @@ graph TD
         PG[(PostgreSQL)]
         S3[(Object Storage - Images/Metadata)]
         PVC[(Read-Only Media PVC)]
+        NFS[(Shared Segment FS - NFS/CephFS)]
     end
 
     Traffic --> LB
@@ -35,14 +36,14 @@ graph TD
     API --> PG
     API --> S3
     API -- Read --> PVC
+    API -- Serve Segments --> NFS
 
     PG -- Queue Count --> KEDA
     KEDA -- Scale --> Worker
     Worker -- Dequeue (HTTP) --> API
     Worker -- Read --> PVC
+    Worker -- Write Segments --> NFS
     Worker -- Update Status (HTTP) --> API
-    API -- Stream Proxy Request --> Worker
-    Worker -- Serve Segments --> API
 ```
 
 ## 2. Core Components
@@ -65,8 +66,8 @@ A specialized fleet of pods dedicated solely to running FFmpeg.
 *   **Technology**: Go wrapper around ffmpeg command line tools.
 *   **Storage Mounts**:
     *   **Media Volume (ReadOnly)**: Direct access to source media files (NFS/CephFS).
-    *   **Ephemeral scratch space**: `emptyDir` (RAM Disk) to store HLS segments (`.ts`) and manifests (`.m3u8`).
-*   **Network**: Runs a lightweight HTTP server to serve the generated HLS segments internally.
+    *   **Shared Segment Volume (ReadWrite)**: NFS/CephFS `ReadWriteMany` PVC mounted at `SEGMENT_DIR` (default `/shared/segments`). Workers write `.ts` files here; the Control Plane reads them directly. No internal HTTP server is needed.
+*   **Network**: No inbound ports required. Workers only make outbound HTTP calls to the Control Plane's queue API.
 *   **Scaling**: KEDA (Kubernetes Event-driven Autoscaling). Scales from 0 to N based on the length of the Postgres `transcode_jobs` table.
 *   **Hardware**: Pods utilize Kubernetes Device Plugins to request GPU resources (nvidia.com/gpu, intel.com/gpu).
 
@@ -101,14 +102,15 @@ The user requires transcoding due to incompatible codecs or bitrate limits.
 5.  **Processing**:
     *   **Worker Pod 1** starts, requests job from Control Plane.
     *   Starts FFmpeg process.
-    *   FFmpeg writes `segment_0.ts` to local RAM disk.
-    *   Worker Pod 1 starts internal HTTP server on port 8080.
-    *   Worker Pod 1 updates status to "Ready" via Control Plane (updates Postgres) and sets worker address `10.42.5.5:8080`.
+    *   FFmpeg writes `segment_0.ts` to the **Shared Segment Volume** (`SEGMENT_DIR`).
+    *   Worker reports segment metadata to Control Plane (Postgres `job_segments` row).
+    *   Worker updates job status to "Ready".
 6.  **Streaming**:
     *   API Pod A detects "Ready" signal.
-    *   API Pod A acts as a **Reverse Proxy**.
-    *   API fetches `http://10.42.5.5:8080/stream.m3u8` and forwards to User.
-7.  **Failover**: If User requests segment 5, and the Load Balancer routes them to **API Pod B**, Pod B simply looks up `worker_address` in Postgres, finds the Worker IP, and proxies the stream. The user session is sticky to the stream, not the API pod.
+    *   When a client requests `segment_0.ts`, API Pod A looks up the segment in Postgres (confirming FFmpeg closed the file), then serves it directly from the **Shared Segment Volume** via `http.ServeFile`.
+    *   No reverse proxy to the worker is needed — the shared volume is readable by all API pods.
+7.  **Failover**: If User requests segment 5, and the Load Balancer routes them to **API Pod B**, Pod B looks up the segment in Postgres, finds the `.ts` file on the same shared volume, and serves it. No worker IP is involved.
+8.  **Worker Death Recovery**: If a worker dies mid-stream, its segments persist on the shared volume. The recovery monitor detects the heartbeat timeout, marks the worker dead (incrementing discontinuity count), and triggers JIT recovery from the **latest segment file on disk** — not from DB state. Clients keep playing existing segments through the gap.
 
 ## 4. Database Schema Design (Migration from SQLite)
 
@@ -129,11 +131,12 @@ The move to Postgres requires a schema refactor to ensure referential integrity 
 *   **Deployment (API)**:
     *   Replicas: 3
     *   ReadinessProbe: Checks DB connection.
-    *   VolumeMounts: `/media` (ReadOnly).
+    *   VolumeMounts: `/media` (ReadOnly), `/shared/segments` (ReadOnly).
 *   **Deployment (Workers)**:
     *   Replicas: 0 (Managed by KEDA).
     *   Tolerations: `gpu-node=true`.
-    *   VolumeMounts: `/media` (ReadOnly).
+    *   VolumeMounts: `/media` (ReadOnly), `/shared/segments` (ReadWrite).
+*   **PersistentVolumeClaim (Shared Segments)**: `accessModes: ["ReadWriteMany"]`, backed by NFS or CephFS. Mounted at `SEGMENT_DIR` (default `/shared/segments`) in both API and Worker pods.
 *   **Service (Internal)**: ClusterIP for API and PostgreSQL.
 *   **Service (Headless)**: For Worker discovery (optional, if not using direct IP lookup).
 
@@ -150,8 +153,10 @@ The move to Postgres requires a schema refactor to ensure referential integrity 
 
 ## 7. Potential Challenges & Mitigations
 
-*   **Network Latency**: Proxying streams from Worker -> API -> User adds hops.
-    *   *Mitigation*: Keep API and Workers in the same zone/cluster. Use gRPC for stream transport if HTTP/1.1 is too slow.
+*   **NFS Write Visibility**: Segments written by a worker may not be immediately visible to the Control Plane on some NFS configurations.
+    *   *Mitigation*: The segment handler gates on a Postgres `job_segments` DB row (written by the worker after FFmpeg closes the file) before serving from disk. If the file is still not visible, the JIT recovery path re-transcodes it.
+*   **Orphaned Segment Files**: If the Control Plane crashes between `DeleteJob` and `os.RemoveAll(segmentDir)`, segment files are orphaned on the shared volume.
+    *   *Mitigation*: A periodic orphan-cleanup job should scan `SEGMENT_DIR` for directories without a matching DB row.
 *   **Orphaned Workers**: If an API pod crashes before killing a transcode job, the worker might run forever.
     *   *Mitigation*: Workers implement a heartbeat and status check system. If they don't receive a valid job status from the API every few seconds (or if the job is deleted), they self-terminate.
 *   **Database Migration**: Moving users from SQLite to Postgres.

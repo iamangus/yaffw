@@ -1,5 +1,35 @@
 database_url: "postgres://user:password@localhost:5432/yaffw?sslmode=disable"
-data_dir: "./data"
 port: "8096"
-tmdb_api_key: "YOUR_TMDB_API_KEY"
-artwork_dir: "./artwork"
+frontend_api_key: "your-secret-api-key"
+
+libraries:
+  - name: "Movies"
+    path: "/mnt/media/movies"
+    type: "movie"
+    metadata_provider: "nfo"          # "nfo" (default) or "omniarr"
+    scan_interval: "10m"              # periodic rescan interval
+    watch_fs: true                    # enable inotify filesystem watching
+    missing_grace_period: "never"     # "never", "30d", etc.
+    # Omniarr provider settings (only needed if metadata_provider is "omniarr"):
+    # omniarr_url: "http://omniarr-movies:8080"
+    # omniarr_api_key: "your-omniarr-api-key"
+
+  - name: "Series"
+    path: "/mnt/media/tv"
+    type: "series"
+    metadata_provider: "nfo"
+    scan_interval: "10m"
+    watch_fs: true
+    missing_grace_period: "never"
+
+transcode:
+  internal_token: "shared-secret-for-workers"
+  hls_segment_time: 4
+  heartbeat_interval: 1
+  status_check_interval: 5
+  dead_worker_threshold: 3
+  idle_timeout: 60
+  completed_retention: 300
+  manifest_timeout: 30
+  max_restarts: 3
+  parallel_ranges: 0                 # 0 or 1 = single job, 2+ = parallel sub-jobs

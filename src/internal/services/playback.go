@@ -2,57 +2,68 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/yaffw/yaffw/src/internal/domain"
-	"github.com/yaffw/yaffw/src/internal/ports"
 )
 
 type PlaybackService struct {
-	mediaRepo   ports.MediaRepository
 	ffprobePath string
 }
 
-func NewPlaybackService(repo ports.MediaRepository, ffprobePath string) *PlaybackService {
+func NewPlaybackService(ffprobePath string) *PlaybackService {
 	return &PlaybackService{
-		mediaRepo:   repo,
 		ffprobePath: ffprobePath,
 	}
 }
 
-// ProbeMedia uses ffprobe (or ffmpeg -i) to get media info
+// ProbeMedia uses ffprobe with JSON output (L8) — replaces fragile stderr regex parsing.
 func (s *PlaybackService) ProbeMedia(ctx context.Context, filePath string) (*domain.MediaProbe, error) {
-	// Use ffmpeg -i since we may not have ffprobe
-	ffmpegPath := strings.Replace(s.ffprobePath, "ffprobe", "ffmpeg", 1)
+	cmd := exec.CommandContext(ctx, s.ffprobePath,
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		"-show_format",
+		filePath,
+	)
 
-	cmd := exec.CommandContext(ctx, ffmpegPath, "-i", filePath)
-	output, _ := cmd.CombinedOutput() // ffmpeg -i returns non-zero, ignore error
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, parseFFprobeError(err, stderr.String())
+	}
+
+	var result struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+			Width     int    `json:"width"`
+			Height    int    `json:"height"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, err
+	}
 
 	probe := &domain.MediaProbe{}
-	outputStr := string(output)
-
-	// Parse video codec
-	videoRegex := regexp.MustCompile(`Stream #\d+:\d+.*Video: (\w+)`)
-	if matches := videoRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
-		probe.VideoCodec = strings.ToLower(matches[1])
-	}
-
-	// Parse audio codec
-	audioRegex := regexp.MustCompile(`Stream #\d+:\d+.*Audio: (\w+)`)
-	if matches := audioRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
-		probe.AudioCodec = strings.ToLower(matches[1])
-	}
-
-	// Parse resolution
-	resRegex := regexp.MustCompile(`(\d{3,4})x(\d{3,4})`)
-	if matches := resRegex.FindStringSubmatch(outputStr); len(matches) > 2 {
-		probe.Width, _ = strconv.Atoi(matches[1])
-		probe.Height, _ = strconv.Atoi(matches[2])
+	for _, stream := range result.Streams {
+		switch stream.CodecType {
+		case "video":
+			probe.VideoCodec = strings.ToLower(stream.CodecName)
+			probe.Width = stream.Width
+			probe.Height = stream.Height
+		case "audio":
+			probe.AudioCodec = strings.ToLower(stream.CodecName)
+		}
 	}
 
 	// Determine container from extension
@@ -68,6 +79,8 @@ func (s *PlaybackService) ProbeMedia(ctx context.Context, filePath string) (*dom
 		probe.Container = "avi"
 	case ".mov":
 		probe.Container = "mov"
+	case ".ts":
+		probe.Container = "ts"
 	default:
 		probe.Container = ext
 	}
@@ -76,6 +89,26 @@ func (s *PlaybackService) ProbeMedia(ctx context.Context, filePath string) (*dom
 		filePath, probe.VideoCodec, probe.AudioCodec, probe.Container, probe.Width, probe.Height)
 
 	return probe, nil
+}
+
+func parseFFprobeError(err error, stderr string) error {
+	if stderr != "" {
+		return &ffprobeError{err: err, stderr: stderr}
+	}
+	return err
+}
+
+type ffprobeError struct {
+	err    error
+	stderr string
+}
+
+func (e *ffprobeError) Error() string {
+	return e.err.Error() + " (stderr: " + e.stderr + ")"
+}
+
+func (e *ffprobeError) Unwrap() error {
+	return e.err
 }
 
 // DeterminePlaybackStrategy decides if we need to transcode
@@ -106,7 +139,7 @@ func (s *PlaybackService) DeterminePlaybackStrategy(
 
 	if !videoCompatible {
 		job.NeedsTranscode = true
-		job.TargetVideoCodec = "libx264" // Safest fallback
+		job.TargetVideoCodec = "libx264"
 		log.Printf("Video codec %s not supported, will transcode to H.264", probe.VideoCodec)
 	}
 
@@ -135,10 +168,14 @@ func (s *PlaybackService) DeterminePlaybackStrategy(
 		log.Printf("Container %s not supported for direct play, will remux/transcode", probe.Container)
 	}
 
-	// If we need to transcode, we're outputting HLS
 	if job.NeedsTranscode {
 		job.TargetContainer = "hls"
 	}
 
 	return job
+}
+
+// ParseDuration parses a duration string from ffprobe JSON output.
+func ParseDuration(s string) (float64, error) {
+	return strconv.ParseFloat(s, 64)
 }

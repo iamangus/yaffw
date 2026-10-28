@@ -1,11 +1,12 @@
 package services
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,78 +15,72 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaffw/yaffw/src/internal/config"
 	"github.com/yaffw/yaffw/src/internal/domain"
 	"github.com/yaffw/yaffw/src/internal/ports"
 )
 
+// TranscodeWorker runs ffmpeg for transcoding jobs dequeued from the queue.
+// Each worker instance processes one job at a time; horizontal scaling is achieved
+// by running multiple worker replicas that all pull from the same Postgres-backed queue.
 type TranscodeWorker struct {
 	queue      ports.JobQueue
 	workerID   string
 	ffmpegPath string
-	tempDir    string
-	logsDir    string
+	segmentDir string
+	cfg        config.TranscodeConfig
+	encoder    config.EncoderConfig
 }
 
-func NewTranscodeWorker(queue ports.JobQueue, id string) *TranscodeWorker {
-	// Use system ffmpeg
+// NewTranscodeWorker creates a worker that writes segment files into segmentDir.
+// If segmentDir is empty, it falls back to ./temp/transcode under the current working directory.
+// The segmentDir should be a shared filesystem (NFS/RWX PVC) mounted by both workers
+// and the Control Plane so segments are directly readable by the segment handler.
+func NewTranscodeWorker(queue ports.JobQueue, id string, tcfg config.TranscodeConfig, enc config.EncoderConfig, segmentDir string) *TranscodeWorker {
 	ffmpegPath := "ffmpeg"
 
-	// Create temp dir
-	cwd, _ := os.Getwd()
-	tempDir := filepath.Join(cwd, "temp", "transcode")
-	os.MkdirAll(tempDir, 0755)
+	if segmentDir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			log.Printf("[Worker %s] Warning: os.Getwd failed (%v); falling back to /tmp for segmentDir", id, err)
+			cwd = "/tmp"
+		}
+		segmentDir = filepath.Join(cwd, "temp", "transcode")
+		log.Printf("[Worker %s] Warning: segmentDir was empty, falling back to %s", id, segmentDir)
+	}
+	if err := os.MkdirAll(segmentDir, 0755); err != nil {
+		log.Printf("[Worker %s] CRITICAL: Failed to create segmentDir %s: %v (worker will fail per-job at MkdirAll)", id, segmentDir, err)
+	}
 
-	// Create logs dir
-	logsDir := filepath.Join(cwd, "logs")
-	os.MkdirAll(logsDir, 0755)
+	tcfg = tcfg.WithDefaults()
+	if enc.Preset == "" {
+		enc = config.DefaultEncoder()
+	}
 
 	return &TranscodeWorker{
 		queue:      queue,
 		workerID:   id,
 		ffmpegPath: ffmpegPath,
-		tempDir:    tempDir,
-		logsDir:    logsDir,
+		segmentDir: segmentDir,
+		cfg:        tcfg,
+		encoder:    enc,
 	}
 }
 
+// Start is the worker's main loop. It blocks until ctx is cancelled, dequeuing
+// and processing jobs one at a time. On error or empty queue it sleeps 1s before retrying.
 func (w *TranscodeWorker) Start(ctx context.Context) {
-	log.Printf("Worker %s started using ffmpeg at %s", w.workerID, w.ffmpegPath)
-
-	// Start Internal HTTP Server for serving segments
-	go func() {
-		port := os.Getenv("WORKER_PORT")
-		if port == "" {
-			port = "8080"
-		}
-		log.Printf("Worker %s starting internal file server on :%s serving %s", w.workerID, port, w.tempDir)
-
-		mux := http.NewServeMux()
-		mux.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
-			// Playlist requests should go through ControlPlane, not directly to worker
-			if strings.HasSuffix(r.URL.Path, ".m3u8") {
-				http.Error(rw, "Playlist requests must go through ControlPlane at /hls/{job-id}/stream.m3u8", http.StatusBadRequest)
-				log.Printf("[Worker %s] Rejected direct playlist request: %s (should use ControlPlane)", w.workerID, r.URL.Path)
-				return
-			}
-			// Default file server for segment files (.ts)
-			log.Printf("[Worker %s] Serving file request: %s", w.workerID, r.URL.Path)
-			http.FileServer(http.Dir(w.tempDir)).ServeHTTP(rw, r)
-		})
-
-		if err := http.ListenAndServe(":"+port, mux); err != nil {
-			log.Printf("Worker file server failed: %v", err)
-		}
-	}()
+	log.Printf("Worker %s started using ffmpeg at %s (segmentDir: %s)", w.workerID, w.ffmpegPath, w.segmentDir)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			job, err := w.queue.Dequeue(ctx)
+			job, err := w.queue.Dequeue(ctx, w.workerID)
 			if err != nil {
-				if err.Error() != "empty queue" {
-					log.Printf("Dequeue error: %v", err)
+				if !errors.Is(err, ports.ErrEmptyQueue) {
+					log.Printf("[Worker %s] Dequeue error: %v", w.workerID, err)
 				}
 				time.Sleep(1 * time.Second)
 				continue
@@ -96,25 +91,17 @@ func (w *TranscodeWorker) Start(ctx context.Context) {
 	}
 }
 
+// processJob is the per-job state machine: Processing → Ready → Completed/Failed.
+// It spawns a heartbeat goroutine, runs ffmpeg, watches the .m3u8 manifest for segment
+// durations, and handles recovery analysis for restarted jobs. On cancel/failure it
+// cleans up the job directory; on success it leaves segments for the CP watchdog.
 func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJob) {
 	log.Printf("[Worker %s] Picked up job %s for media %s", w.workerID, job.ID, job.FilePath)
 
 	// Update Status: Processing & Immediate Heartbeat
 	job.Status = "Processing"
 	job.WorkerID = w.workerID
-
-	// Set Worker Address
-	workerIP := os.Getenv("WORKER_IP")
-	if workerIP == "" {
-		workerIP = "127.0.0.1"
-	}
-	workerPort := os.Getenv("WORKER_PORT")
-	if workerPort == "" {
-		workerPort = "8080"
-	}
-	job.WorkerAddress = fmt.Sprintf("http://%s:%s", workerIP, workerPort)
-
-	job.LastHeartbeat = time.Now() // Critical: Set heartbeat immediately
+	job.LastHeartbeat = time.Now()
 	if err := w.queue.UpdateJob(ctx, job); err != nil {
 		log.Printf("[Worker %s] CRITICAL: Failed to mark job %s as Processing: %v", w.workerID, job.ID, err)
 	} else {
@@ -126,28 +113,33 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 	}
 
 	// Prepare Output Directory
-	jobDir := filepath.Join(w.tempDir, job.ID)
+	jobDir := filepath.Join(w.segmentDir, job.ID)
 	if err := os.MkdirAll(jobDir, 0755); err != nil {
 		log.Printf("[Worker %s] CRITICAL: Failed to create job directory %s: %v", w.workerID, jobDir, err)
 		job.Status = "Failed"
-		w.queue.UpdateJob(ctx, job)
+		job.FailureReason = fmt.Sprintf("Failed to create job directory: %v", err)
+		if err := w.queue.UpdateJob(ctx, job); err != nil {
+			log.Printf("[Worker %s] CRITICAL: Failed to mark job %s as Failed (mkdir): %v", w.workerID, job.ID, err)
+		}
 		return
 	}
 
 	outputPath := filepath.Join(jobDir, "stream.m3u8")
 
-	// Create a cancellable context for this job to kill ffmpeg/heartbeats on failure/cancellation
 	jobCtx, jobCancel := context.WithCancel(ctx)
 	defer jobCancel()
 
-	// Start Heartbeat Loop (Managed via context)
-	// We start this AFTER sending the first update, but parallel to FFmpeg
-	// Use jobCtx so we can cancel it if the job is cancelled
+	// Heartbeat loop uses cheap Heartbeat() for 1s ticks, UpdateJob only for status changes.
+	// Heartbeat loop: uses context.Background() instead of jobCtx deliberately —
+	// the status check must outlive a cancelled jobCtx so we can detect the cancellation
+	// (job deletion, worker reassignment) and stop ffmpeg via jobCancel().
 	go func() {
-		ticker := time.NewTicker(1 * time.Second) // Fast Heartbeat (1s)
+		hbInterval := time.Duration(w.cfg.HeartbeatInterval) * time.Second
+		ticker := time.NewTicker(hbInterval)
 		defer ticker.Stop()
 
-		statusTicker := time.NewTicker(5 * time.Second)
+		statusInterval := time.Duration(w.cfg.StatusCheckInterval) * time.Second
+		statusTicker := time.NewTicker(statusInterval)
 		defer statusTicker.Stop()
 
 		for {
@@ -155,23 +147,23 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 			case <-jobCtx.Done():
 				return
 			case <-statusTicker.C:
-				// Check status periodically
 				currentJob, err := w.queue.GetJob(context.Background(), job.ID)
 				if err != nil {
 					log.Printf("[Worker %s] Job %s missing/deleted. Stopping.", w.workerID, job.ID)
 					jobCancel()
 					return
 				}
-				if currentJob.Status == "Cancelled" {
-					log.Printf("[Worker %s] Job %s was Cancelled. Stopping.", w.workerID, job.ID)
+				if currentJob.Status == "Cancelled" || currentJob.Status == "Pending" || currentJob.WorkerID != w.workerID {
+					log.Printf("[Worker %s] Job %s no longer owned by this worker (Status: %s, Owner: %s). Stopping.",
+						w.workerID, job.ID, currentJob.Status, currentJob.WorkerID)
 					jobCancel()
 					return
 				}
 			case <-ticker.C:
-				job.LastHeartbeat = time.Now()
-				if err := w.queue.UpdateJob(context.Background(), job); err != nil {
-					log.Printf("[Worker %s] ERROR: Heartbeat failed for job %s (Job lost/cancelled?): %v", w.workerID, job.ID, err)
-					jobCancel() // Kill ffmpeg
+				// Cheap heartbeat — no full-row write, no segment fetch
+				if err := w.queue.Heartbeat(context.Background(), job.ID, w.workerID); err != nil {
+					log.Printf("[Worker %s] Heartbeat failed for job %s: %v", w.workerID, job.ID, err)
+					jobCancel()
 					return
 				}
 			}
@@ -182,55 +174,60 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 	startSegment := 0
 	startTime := 0.0
 
-	// Priority 1: Explicit start point from Control Plane (JIT/Ephemeral Recovery)
 	if job.StartSegment > 0 {
 		startSegment = job.StartSegment
 		startTime = job.StartTime
 		log.Printf("[Worker %s] JIT START: Starting job %s at segment %d (time: %.2fs) as requested by Control Plane.",
 			w.workerID, job.ID, startSegment, startTime)
 	} else if job.RestartCount > 0 {
-		// Priority 2: Local recovery (if files exist on this node)
-		// Analyze existing segments to determine actual progress
 		startSegment, startTime = w.analyzeExistingSegments(jobDir)
 		if startSegment > 0 {
-			log.Printf("[Worker %s] LOCAL RECOVERY: Resuming job %s from segment %d (time: %.2fs). Previous segments found.",
+			log.Printf("[Worker %s] LOCAL RECOVERY: Resuming job %s from segment %d (time: %.2fs).",
 				w.workerID, job.ID, startSegment, startTime)
-
-			// Update job with progress info
 			job.LastSegmentNum = startSegment - 1
 			job.TranscodedDuration = startTime
-
-			// Hard Reset Strategy: Delete the old playlist.
-			os.Remove(outputPath)
+			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[Worker %s] Warning: failed to remove stale manifest %s: %v", w.workerID, outputPath, err)
+			}
 		}
 	}
 
-	// Build FFmpeg command based on job settings
-	args := w.buildFFmpegArgs(job, jobDir, outputPath, startSegment, startTime)
+	// Phase 3: For range sub-jobs, use range boundaries
+	rangeEnd := 0.0
+	if job.ParentJobID != "" && job.RangeEnd > 0 {
+		startSegment = job.StartSegment
+		startTime = job.RangeStart
+		rangeEnd = job.RangeEnd
+		log.Printf("[Worker %s] RANGE SUB-JOB: %s range %d/%d (%.1fs-%.1fs), startSeg=%d",
+			w.workerID, job.ID, job.RangeIndex, job.TotalRanges, job.RangeStart, job.RangeEnd, startSegment)
+	}
+
+	// Build FFmpeg command
+	args := w.buildFFmpegArgs(job, jobDir, outputPath, startSegment, startTime, rangeEnd)
 	cmd := exec.CommandContext(jobCtx, w.ffmpegPath, args...)
 
-	// Redirect logs to file for debugging
-	logFile, err := os.Create(filepath.Join(w.logsDir, fmt.Sprintf("ffmpeg-%s.log", job.ID)))
-	if err == nil {
-		cmd.Stderr = logFile
-		cmd.Stdout = logFile
-		defer logFile.Close()
-	} else {
-		log.Printf("Failed to create log file: %v", err)
-	}
+	// Stream ffmpeg output to stdout/stderr (captured by container runtime)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	log.Printf("Running FFmpeg: %s", cmd.String())
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("[Worker %s] CRITICAL: Failed to start FFmpeg process for job %s: %v", w.workerID, job.ID, err)
+		log.Printf("[Worker %s] CRITICAL: Failed to start FFmpeg for job %s: %v", w.workerID, job.ID, err)
 		job.Status = "Failed"
-		w.queue.UpdateJob(ctx, job)
+		job.FailureReason = fmt.Sprintf("Failed to start ffmpeg: %v", err)
+		if err := w.queue.UpdateJob(ctx, job); err != nil {
+			log.Printf("[Worker %s] CRITICAL: Failed to mark job %s as Failed (ffmpeg start): %v", w.workerID, job.ID, err)
+		}
+		w.cleanupJobDir(jobDir)
 		return
 	}
 
-	// Poll for manifest creation (up to 30s)
+	// Poll for manifest creation
+	manifestTimeout := time.Duration(w.cfg.ManifestTimeout) * time.Second
 	ready := false
-	for i := 0; i < 30; i++ {
+	deadline := time.Now().Add(manifestTimeout)
+	for time.Now().Before(deadline) {
 		if _, err := os.Stat(outputPath); err == nil {
 			ready = true
 			break
@@ -239,57 +236,109 @@ func (w *TranscodeWorker) processJob(ctx context.Context, job *domain.TranscodeJ
 	}
 
 	if !ready {
-		log.Printf("[Worker %s] ERROR: Timed out waiting for HLS manifest creation at %s", w.workerID, outputPath)
-		cmd.Process.Kill()
+		log.Printf("[Worker %s] ERROR: Timed out waiting for HLS manifest at %s", w.workerID, outputPath)
+		if err := cmd.Process.Kill(); err != nil {
+			log.Printf("[Worker %s] Warning: failed to kill ffmpeg process for job %s: %v", w.workerID, job.ID, err)
+		}
 		job.Status = "Failed"
-		w.queue.UpdateJob(ctx, job)
+		job.FailureReason = "Manifest creation timeout"
+		if err := w.queue.UpdateJob(ctx, job); err != nil {
+			log.Printf("[Worker %s] CRITICAL: Failed to mark job %s as Failed (manifest timeout): %v", w.workerID, job.ID, err)
+		}
+		w.cleanupJobDir(jobDir)
 		return
 	}
 
-	// Update Job
+	// Update Job to Ready
 	job.Status = "Ready"
 	job.StreamURL = fmt.Sprintf("/hls/%s/stream.m3u8", job.ID)
-	w.queue.UpdateJob(ctx, job)
+	if err := w.queue.UpdateJob(ctx, job); err != nil {
+		log.Printf("[Worker %s] CRITICAL: Failed to mark job %s as Ready: %v", w.workerID, job.ID, err)
+	}
 
 	if job.RestartCount > 0 {
-		log.Printf("[Worker %s] RECOVERY: Stream manifest ready for job %s. Stream resumed. (FFmpeg PID %d)", w.workerID, job.ID, cmd.Process.Pid)
+		log.Printf("[Worker %s] RECOVERY: Stream ready for job %s. (FFmpeg PID %d)", w.workerID, job.ID, cmd.Process.Pid)
 	} else {
 		log.Printf("[Worker %s] Job %s Ready. Stream started. (FFmpeg PID %d)", w.workerID, job.ID, cmd.Process.Pid)
 	}
 
-	// Start Segment Watcher AFTER FFmpeg is ready and we know the start segment
-	// Pass startSegment so the watcher only reports segments this worker creates
-	go w.watchSegments(jobCtx, job.ID, jobDir, startSegment)
+	// Segment watcher uses ffmpeg's .m3u8 manifest for durations instead of ffprobe per segment.
+	// Report segments under the parent job ID for sub-jobs (Phase 3).
+	reportJobID := job.ID
+	if job.ParentJobID != "" {
+		reportJobID = job.ParentJobID
+	}
+	go w.watchSegments(jobCtx, reportJobID, jobDir, startSegment)
 
-	// Wait for completion (blocking this goroutine to keep heartbeats alive)
-	err = cmd.Wait()
-	// jobCancel deferred above will clean up heartbeats
+	// Wait for completion
+	err := cmd.Wait()
 
 	if err != nil {
 		if jobCtx.Err() != nil {
 			log.Printf("[Worker %s] Job %s Cancelled/Stopped.", w.workerID, job.ID)
+			// Clean up temp dir on cancel
+			w.cleanupJobDir(jobDir)
 		} else {
 			log.Printf("[Worker %s] Job %s FFmpeg finished with error: %v", w.workerID, job.ID, err)
+			job.Status = "Failed"
+			job.FailureReason = fmt.Sprintf("ffmpeg error: %v", err)
+			if err := w.queue.UpdateJob(context.Background(), job); err != nil {
+				log.Printf("[Worker %s] CRITICAL: Failed to mark job %s as Failed (ffmpeg error): %v", w.workerID, job.ID, err)
+			}
 		}
 	} else {
 		log.Printf("[Worker %s] Job %s FFmpeg finished successfully", w.workerID, job.ID)
-		// Mark as Completed so Control Plane stops expecting heartbeats
 		job.Status = "Completed"
 		if err := w.queue.UpdateJob(context.Background(), job); err != nil {
 			log.Printf("[Worker %s] Failed to mark job %s as Completed: %v", w.workerID, job.ID, err)
 		}
+		// Phase 3: Check if parent is now fully completed
+		if job.ParentJobID != "" {
+			w.checkParentCompletion(ctx, job.ParentJobID, job.TotalRanges)
+		}
 	}
 }
 
-// analyzeExistingSegments scans the job directory to find existing segments
-// and calculates the actual transcoded duration by probing segment files
+// cleanupJobDir removes the job's segment directory from the shared filesystem.
+// Called on cancel/failure paths. On success paths, segments are left on disk
+// for the Control Plane watchdog to clean up after the idle retention period.
+func (w *TranscodeWorker) cleanupJobDir(jobDir string) {
+	if err := os.RemoveAll(jobDir); err != nil {
+		log.Printf("[Worker %s] Failed to clean up job dir %s: %v", w.workerID, jobDir, err)
+	} else {
+		log.Printf("[Worker %s] Cleaned up job dir %s", w.workerID, jobDir)
+	}
+}
+
+// checkParentCompletion checks if all sub-jobs for a range-parallel parent are done,
+// and if so marks the parent job as Completed. This uses an optional interface assertion
+// because only the Postgres adapter implements parent-completion tracking; the HTTP
+// queue adapter (used by workers) silently skips this.
+func (w *TranscodeWorker) checkParentCompletion(ctx context.Context, parentJobID string, totalRanges int) {
+	if pq, ok := w.queue.(interface {
+		IsParentJobCompleted(ctx context.Context, parentJobID string, totalRanges int) (bool, error)
+		MarkParentCompleted(ctx context.Context, parentJobID string) error
+	}); ok {
+		done, err := pq.IsParentJobCompleted(ctx, parentJobID, totalRanges)
+		if err == nil && done {
+			log.Printf("[Worker %s] All %d sub-jobs completed for parent %s. Marking parent Completed.", w.workerID, totalRanges, parentJobID)
+			if err := pq.MarkParentCompleted(ctx, parentJobID); err != nil {
+				log.Printf("[Worker %s] Failed to mark parent %s as Completed: %v", w.workerID, parentJobID, err)
+			}
+		}
+	}
+}
+
+// analyzeExistingSegments scans the shared job directory for existing .ts files
+// (written by a previous worker that died), validates the trailing segments with ffprobe,
+// and returns the next segment number and accumulated duration for ffmpeg resume.
+// Corrupt or truncated trailing segments are removed before the scan returns.
 func (w *TranscodeWorker) analyzeExistingSegments(jobDir string) (nextSegment int, totalDuration float64) {
 	files, err := filepath.Glob(filepath.Join(jobDir, "segment_*.ts"))
 	if err != nil || len(files) == 0 {
 		return 0, 0.0
 	}
 
-	// Parse segment numbers and sort them
 	type segmentFile struct {
 		Number int
 		Path   string
@@ -313,30 +362,27 @@ func (w *TranscodeWorker) analyzeExistingSegments(jobDir string) (nextSegment in
 	}
 
 	// Verify segments from last to first, removing corrupt ones
-	// Iterate backwards to find the last valid segment
 	for i := len(segments) - 1; i >= 0; i-- {
 		seg := segments[i]
 		_, duration, err := w.probeSegment(seg.Path)
-
 		if err != nil {
-			log.Printf("[Worker %s] RECOVERY: Found corrupt segment %s (Error: %v). Deleting...", w.workerID, seg.Path, err)
-			os.Remove(seg.Path)
-			continue // Skip this segment and check the previous one
-		}
-
-		// Optimization: If we found a valid segment, we assume previous ones are valid (tail corruption only)
-		// Check if the segment is significantly shorter than target duration (4s), indicating truncation
-		if duration < 2.0 {
-			log.Printf("[Worker %s] RECOVERY: Segment %s is valid but truncated (Duration: %.2fs). Deleting...", w.workerID, seg.Path, duration)
-			os.Remove(seg.Path)
+			log.Printf("[Worker %s] RECOVERY: Found corrupt segment %s. Deleting...", w.workerID, seg.Path)
+			if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
+				log.Printf("[Worker %s] Warning: failed to remove corrupt segment %s: %v", w.workerID, seg.Path, err)
+			}
 			continue
 		}
-
-		log.Printf("[Worker %s] RECOVERY: Segment %s is valid (Duration: %.2fs). Stopping verification.", w.workerID, seg.Path, duration)
+		if duration < 2.0 {
+			log.Printf("[Worker %s] RECOVERY: Segment %s is truncated (Dur: %.2fs). Deleting...", w.workerID, seg.Path, duration)
+			if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
+				log.Printf("[Worker %s] Warning: failed to remove truncated segment %s: %v", w.workerID, seg.Path, err)
+			}
+			continue
+		}
 		break
 	}
 
-	// Re-scan to get the clean list after deletion
+	// Re-scan
 	files, _ = filepath.Glob(filepath.Join(jobDir, "segment_*.ts"))
 	segments = []segmentFile{}
 	for _, f := range files {
@@ -354,45 +400,43 @@ func (w *TranscodeWorker) analyzeExistingSegments(jobDir string) (nextSegment in
 		return 0, 0.0
 	}
 
-	// Calculate resume point from the last segment's timestamp + duration
-	// This handles cases where segments might overlap or have gaps, ensuring we resume exactly where we left off.
 	lastSeg := segments[len(segments)-1]
 	startTimeVal, duration, err := w.probeSegment(lastSeg.Path)
 	if err != nil {
-		log.Printf("[Worker %s] RECOVERY: Failed to probe last segment %s: %v. Fallback to 0.", w.workerID, lastSeg.Path, err)
-		return 0, 0.0
+		log.Printf("[Worker %s] RECOVERY: Last segment %s probe failed (%v). Trying second-to-last.", w.workerID, lastSeg.Path, err)
+		if len(segments) >= 2 {
+			lastSeg = segments[len(segments)-2]
+			startTimeVal, duration, err = w.probeSegment(lastSeg.Path)
+		}
+		if err != nil {
+			log.Printf("[Worker %s] RECOVERY: Fallback probe also failed. Restarting from segment 0.", w.workerID)
+			return 0, 0.0
+		}
 	}
 
 	totalDuration = startTimeVal + duration
-
-	// Next segment is one after the highest numbered segment
 	nextSegment = segments[len(segments)-1].Number + 1
 
-	log.Printf("[Worker %s] RECOVERY ANALYSIS: Found %d existing segments (Range: %d-%d), resume time: %.2fs (Last Seg Start: %.2f + Dur: %.2f), next segment: %d",
-		w.workerID, len(segments), segments[0].Number, segments[len(segments)-1].Number, totalDuration, startTimeVal, duration, nextSegment)
+	log.Printf("[Worker %s] RECOVERY: Found %d segments (Range: %d-%d), resume: %.2fs, next: %d",
+		w.workerID, len(segments), segments[0].Number, segments[len(segments)-1].Number, totalDuration, nextSegment)
 
 	return nextSegment, totalDuration
 }
 
-// probeSegment uses ffprobe to get start time and duration of a segment
+// probeSegment runs ffprobe on a single .ts file and returns its start_time and duration.
+// Both values are needed because some containers report a non-zero start_time.
 func (w *TranscodeWorker) probeSegment(segmentPath string) (startTime float64, duration float64, err error) {
-	// Use system ffprobe
-	ffprobePath := "ffprobe"
-
-	cmd := exec.Command(ffprobePath,
-		"-v", "error", // Use error level to catch issues
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
 		"-print_format", "json",
 		"-show_format",
 		segmentPath,
 	)
-
-	// Capture stderr to see why it failed
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-
 	output, err := cmd.Output()
 	if err != nil {
-		return 0.0, 0.0, fmt.Errorf("ffprobe failed: %v (Stderr: %s)", err, stderr.String())
+		return 0.0, 0.0, fmt.Errorf("ffprobe failed: %v; stderr: %s", err, stderr.String())
 	}
 
 	var result struct {
@@ -401,29 +445,34 @@ func (w *TranscodeWorker) probeSegment(segmentPath string) (startTime float64, d
 			StartTime string `json:"start_time"`
 		} `json:"format"`
 	}
-
 	if err := json.Unmarshal(output, &result); err != nil {
-		return 0.0, 0.0, fmt.Errorf("invalid json: %v", err)
+		return 0.0, 0.0, err
 	}
 
 	duration, err = strconv.ParseFloat(result.Format.Duration, 64)
 	if err != nil {
-		return 0.0, 0.0, fmt.Errorf("invalid duration: %v", err)
+		log.Printf("[Worker %s] Warning: ffprobe returned non-numeric duration %q for %s: %v", w.workerID, result.Format.Duration, segmentPath, err)
 	}
-
-	// StartTime might be missing or "N/A" in some cases, default to 0 if parsing fails
-	// But for HLS segments it should be there.
-	startTime, _ = strconv.ParseFloat(result.Format.StartTime, 64)
-
+	startTime, err = strconv.ParseFloat(result.Format.StartTime, 64)
+	if err != nil && result.Format.StartTime != "" {
+		log.Printf("[Worker %s] Warning: ffprobe returned non-numeric start_time %q for %s: %v", w.workerID, result.Format.StartTime, segmentPath, err)
+	}
 	return startTime, duration, nil
 }
 
-func (w *TranscodeWorker) buildFFmpegArgs(job *domain.TranscodeJob, jobDir, outputPath string, startSegment int, startTime float64) []string {
+// buildFFmpegArgs constructs the ffmpeg argument list for a transcoding job.
+// Resume numbering is handled via -start_number and -output_ts_offset; input seeking
+// via -ss is used for both JIT recovery (startTime) and range sub-jobs (rangeEnd).
+// On resume, video codec is forced to libx264 because -ss stream-copy produces
+// broken keyframe alignment at the segment boundary.
+func (w *TranscodeWorker) buildFFmpegArgs(job *domain.TranscodeJob, jobDir, outputPath string, startSegment int, startTime float64, rangeEnd float64) []string {
 	args := []string{}
 
-	// Seeking input (if resuming) - use accurate seek time from segment analysis
-	if startSegment > 0 && startTime > 0 {
-		// Use precise time from segment analysis instead of estimated time
+	// Phase 3: For range sub-jobs, use -ss and -to for input seeking
+	if rangeEnd > 0 {
+		args = append(args, "-ss", fmt.Sprintf("%.3f", startTime))
+		args = append(args, "-to", fmt.Sprintf("%.3f", rangeEnd))
+	} else if startSegment > 0 && startTime > 0 {
 		args = append(args, "-ss", fmt.Sprintf("%.3f", startTime))
 	}
 
@@ -432,11 +481,8 @@ func (w *TranscodeWorker) buildFFmpegArgs(job *domain.TranscodeJob, jobDir, outp
 	// Determine video codec
 	videoCodec := job.TargetVideoCodec
 	if videoCodec == "" {
-		videoCodec = "libx264" // Default fallback
+		videoCodec = "libx264"
 	}
-
-	// Force re-encode on resume to ensure timestamp alignment and accurate seeking.
-	// Stream copy with seeking often causes gaps/discontinuities in HLS.
 	if startSegment > 0 {
 		videoCodec = "libx264"
 	}
@@ -446,129 +492,157 @@ func (w *TranscodeWorker) buildFFmpegArgs(job *domain.TranscodeJob, jobDir, outp
 	} else {
 		args = append(args,
 			"-c:v", videoCodec,
-			"-preset", "ultrafast",
+			"-preset", w.encoder.Preset,
+			"-crf", strconv.Itoa(w.encoder.CRF),
 			"-pix_fmt", "yuv420p",
 			"-profile:v", "main",
-			"-g", "100", // Force keyframe every 4s (25fps * 4) to match HLS segment time
-			"-keyint_min", "100",
-			"-sc_threshold", "0", // Disable scene change detection to enforce strict GOP
 		)
+		// Bitrate cap
+		if w.encoder.MaxRate != "" {
+			args = append(args, "-maxrate", w.encoder.MaxRate, "-bufsize", w.encoder.BufSize)
+		}
+		// Use force_key_frames for accurate 4s segments regardless of fps
+		hlsTime := w.cfg.HLSSegmentTime
+		args = append(args, "-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", hlsTime))
+		args = append(args, "-sc_threshold", "0")
+
+		// Downscale from client caps (stored in job via playback strategy — not yet wired, so skip if 0)
+		// When MaxWidth/MaxHeight are available, add: -vf scale='min(iw,maxw)':-2
 	}
 
-	// Determine audio codec
+	// Audio codec
 	audioCodec := job.TargetAudioCodec
 	if audioCodec == "" {
-		audioCodec = "aac" // Default fallback
+		audioCodec = "aac"
 	}
-
 	if audioCodec == "copy" {
 		args = append(args, "-c:a", "copy")
 	} else {
 		args = append(args,
 			"-c:a", audioCodec,
-			"-ac", "2", // Downmix to stereo for browser compatibility
+			"-ac", "2",
 		)
 	}
 
-	// Disable subtitles
-	args = append(args, "-sn")
+	// Phase 4: Extract subtitles as WebVTT instead of dropping them
+	// Map optional subtitle stream (the ? makes it optional so no error if absent)
+	args = append(args, "-map", "0:v:0", "-map", "0:a:0")
+	args = append(args, "-map", "0:s:0?") // Optional subtitle
+	// For HLS, convert subtitles to webvtt
+	args = append(args, "-c:s", "webvtt")
 
 	// HLS output settings
+	hlsTime := strconv.Itoa(w.cfg.HLSSegmentTime)
 	args = append(args,
 		"-f", "hls",
-		"-hls_time", "4",
+		"-hls_time", hlsTime,
 		"-hls_list_size", "0",
 		"-hls_segment_filename", filepath.Join(jobDir, "segment_%03d.ts"),
 	)
 
-	// If resuming, we need to tell HLS muxer to start numbering segments correctly
+	// Resume numbering
 	if startSegment > 0 {
 		args = append(args, "-start_number", fmt.Sprintf("%d", startSegment))
 		args = append(args, "-output_ts_offset", fmt.Sprintf("%.3f", startTime))
-		// Disabled append_list in favor of Hard Reset strategy
-		// args = append(args, "-hls_flags", "append_list")
 	}
 
 	args = append(args, outputPath)
 
-	log.Printf("[Worker %s] FFmpeg args: video=%s, audio=%s, startSeg=%d, seekTime=%.2fs",
-		w.workerID, videoCodec, audioCodec, startSegment, startTime)
+	log.Printf("[Worker %s] FFmpeg args: video=%s preset=%s crf=%d, audio=%s, startSeg=%d, seekTime=%.2fs, rangeEnd=%.2fs",
+		w.workerID, videoCodec, w.encoder.Preset, w.encoder.CRF, audioCodec, startSegment, startTime, rangeEnd)
 
 	return args
 }
 
+// watchSegments polls ffmpeg's output .m3u8 manifest every 500ms, extracts segment
+// durations and start times, and reports new segments to the queue via AddSegment.
+// This avoids running ffprobe per segment (~1800 execs for a 2h movie).
+// For sub-jobs (Phase 3), segments are reported under the parent job ID.
 func (w *TranscodeWorker) watchSegments(ctx context.Context, jobID, jobDir string, startSegment int) {
-	ticker := time.NewTicker(1 * time.Second)
+	log.Printf("[Worker %s] Segment watcher started for job %s (jobDir: %s, startSeg: %d)", w.workerID, jobID, jobDir, startSegment)
+
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	reportedSegments := make(map[int]bool)
+	manifestPath := filepath.Join(jobDir, "stream.m3u8")
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[Worker %s] Segment watcher stopped for job %s", w.workerID, jobID)
 			return
 		case <-ticker.C:
-			files, err := filepath.Glob(filepath.Join(jobDir, "segment_*.ts"))
-			if err != nil {
-				continue
-			}
-
-			for _, f := range files {
-				base := filepath.Base(f)
-				numStr := strings.TrimSuffix(strings.TrimPrefix(base, "segment_"), ".ts")
-				num, err := strconv.Atoi(numStr)
-				if err != nil {
+			// Parse the .m3u8 that ffmpeg writes to get segment durations
+			entries := w.parseHLSManifest(manifestPath)
+			for _, entry := range entries {
+				if reportedSegments[entry.seq] {
+					continue
+				}
+				if entry.seq < startSegment {
+					reportedSegments[entry.seq] = true
 					continue
 				}
 
-				if reportedSegments[num] {
-					continue
-				}
-
-				// CRITICAL: Only report segments that this worker is responsible for
-				// If we're recovering from segment N onwards, don't report segments < N
-				// as they belong to the previous (dead) worker
-				if num < startSegment {
-					log.Printf("[Worker %s] Skipping segment %d (belongs to previous worker, this worker starts at %d)",
-						w.workerID, num, startSegment)
-					reportedSegments[num] = true // Mark as reported to avoid repeated logs
-					continue
-				}
-
-				// Probe to get duration and start time
-				startTime, duration, err := w.probeSegment(f)
-				if err != nil {
-					// Might be incomplete file, skip for now
-					continue
-				}
-
-				// Report to Control Plane
 				seg := domain.Segment{
-					SequenceID: num,
-					Duration:   duration,
+					SequenceID: entry.seq,
+					Duration:   entry.duration,
 					WorkerID:   w.workerID,
-					WorkerAddr: fmt.Sprintf("http://%s:%s", os.Getenv("WORKER_IP"), os.Getenv("WORKER_PORT")),
-					Timestamp:  startTime,
-				}
-
-				// Fix address if env vars missing
-				if seg.WorkerAddr == "http://:" {
-					seg.WorkerAddr = "http://127.0.0.1:8080"
+					Timestamp:  entry.startTime,
 				}
 
 				if err := w.queue.AddSegment(context.Background(), jobID, seg); err != nil {
-					log.Printf("[Worker %s] Failed to report segment %d: %v", w.workerID, num, err)
+					log.Printf("[Worker %s] Failed to report segment %d: %v", w.workerID, entry.seq, err)
 				} else {
-					fileInfo, _ := os.Stat(f)
-					size := int64(0)
-					if fileInfo != nil {
-						size = fileInfo.Size()
-					}
-					log.Printf("[Worker %s] SEGMENT FOUND: %d (Dur: %.2fs, Start: %.2fs, Size: %d bytes). Reported to Control Plane.",
-						w.workerID, num, duration, startTime, size)
-					reportedSegments[num] = true
+					log.Printf("[Worker %s] SEGMENT: %d (Dur: %.2fs, Start: %.2fs). Reported.",
+						w.workerID, entry.seq, entry.duration, entry.startTime)
+					reportedSegments[entry.seq] = true
+					IncSegmentReported()
 				}
 			}
 		}
 	}
+}
+
+type manifestEntry struct {
+	seq       int
+	duration  float64
+	startTime float64
+}
+
+// parseHLSManifest reads ffmpeg's output .m3u8 and extracts segment info.
+// Returns nil if the manifest does not exist yet (ffmpeg has not created it).
+func (w *TranscodeWorker) parseHLSManifest(manifestPath string) []manifestEntry {
+	file, err := os.Open(manifestPath)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var entries []manifestEntry
+	scanner := bufio.NewScanner(file)
+	currentDuration := 0.0
+	accumulatedTime := 0.0
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#EXTINF:") {
+			durStr := strings.TrimPrefix(line, "#EXTINF:")
+			durStr = strings.TrimSuffix(durStr, ",")
+			currentDuration, _ = strconv.ParseFloat(durStr, 64)
+		} else if strings.HasPrefix(line, "segment_") && strings.HasSuffix(line, ".ts") {
+			numStr := strings.TrimSuffix(strings.TrimPrefix(line, "segment_"), ".ts")
+			if num, err := strconv.Atoi(numStr); err == nil {
+				entries = append(entries, manifestEntry{
+					seq:       num,
+					duration:  currentDuration,
+					startTime: accumulatedTime,
+				})
+				accumulatedTime += currentDuration
+			}
+			currentDuration = 0.0
+		}
+	}
+
+	return entries
 }

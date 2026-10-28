@@ -1,2 +1,7 @@
 control_url: "http://localhost:8000"
 worker_port: "8001"
+omniarr:
+  - name: "Movies"
+    url: "https://omniarr-movies.srvd.site"
+    api_key: "test-api-key"
+    type: "Movies"

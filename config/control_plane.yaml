@@ -1,5 +1,31 @@
 database_url: "postgres://yaffw:yaffw@postgresql.system-database.svc.cluster.local:5432/yaffw?sslmode=disable"
-data_dir: "./data"
-port: "8000"
-tmdb_api_key: "603b3d5b9e211d94564ecf9d857cd522"
-artwork_dir: "./artwork"
+port: "8096"
+frontend_api_key: "change_me"
+
+libraries:
+  - name: "Movies"
+    path: "/mnt/media/movies"
+    type: "movie"
+    metadata_provider: "nfo"
+    scan_interval: "10m"
+    watch_fs: true
+    missing_grace_period: "never"
+  - name: "Series"
+    path: "/mnt/media/tv"
+    type: "series"
+    metadata_provider: "nfo"
+    scan_interval: "10m"
+    watch_fs: true
+    missing_grace_period: "never"
+
+transcode:
+  internal_token: "change_me"
+  hls_segment_time: 4
+  heartbeat_interval: 1
+  status_check_interval: 5
+  dead_worker_threshold: 3
+  idle_timeout: 60
+  completed_retention: 300
+  manifest_timeout: 30
+  max_restarts: 3
+  parallel_ranges: 0

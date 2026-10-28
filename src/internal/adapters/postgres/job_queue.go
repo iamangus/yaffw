@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"log"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/yaffw/yaffw/src/internal/domain"
+	"github.com/yaffw/yaffw/src/internal/ports"
 )
 
 type PostgresJobQueue struct {
@@ -19,6 +21,12 @@ func NewConnection(connStr string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Tune connection pool
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute)
+
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
@@ -36,9 +44,8 @@ func (q *PostgresJobQueue) InitSchema() error {
 			id VARCHAR(255) PRIMARY KEY,
 			media_id VARCHAR(255) NOT NULL,
 			file_path TEXT NOT NULL,
-			status VARCHAR(50) NOT NULL, -- Pending, Processing, Ready, Failed
+			status VARCHAR(50) NOT NULL,
 			worker_id VARCHAR(255),
-			worker_address VARCHAR(255),
 			stream_url TEXT,
 			target_video_codec VARCHAR(50),
 			target_audio_codec VARCHAR(50),
@@ -53,6 +60,8 @@ func (q *PostgresJobQueue) InitSchema() error {
 			recovery_in_progress BOOLEAN DEFAULT FALSE,
 			last_recovery_time TIMESTAMPTZ,
 			last_accessed_at TIMESTAMPTZ DEFAULT NOW(),
+			discontinuity_count INT DEFAULT 0,
+			failure_reason TEXT DEFAULT '',
 			created_at TIMESTAMPTZ DEFAULT NOW()
 		);
 	`)
@@ -60,8 +69,22 @@ func (q *PostgresJobQueue) InitSchema() error {
 		return err
 	}
 
-	// Migration: Add last_accessed_at if it doesn't exist
+	// Migrations for existing tables
 	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ DEFAULT NOW();`)
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS discontinuity_count INT DEFAULT 0;`)
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS failure_reason TEXT DEFAULT '';`)
+	// Phase 3: Range-parallel transcoding columns
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(255) REFERENCES transcode_jobs(id) ON DELETE CASCADE;`)
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS range_index INT DEFAULT 0;`)
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS total_ranges INT DEFAULT 1;`)
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS range_start FLOAT DEFAULT 0;`)
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs ADD COLUMN IF NOT EXISTS range_end FLOAT DEFAULT 0;`)
+	_, _ = q.db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_parent ON transcode_jobs(parent_job_id) WHERE parent_job_id IS NOT NULL;`)
+
+	// Shared-FS refactor: drop columns that are no longer populated.
+	_, _ = q.db.Exec(`ALTER TABLE transcode_jobs DROP COLUMN IF EXISTS worker_address;`)
+	_, _ = q.db.Exec(`ALTER TABLE job_segments DROP COLUMN IF EXISTS worker_addr;`)
+	_, _ = q.db.Exec(`ALTER TABLE job_segments DROP COLUMN IF EXISTS dead;`)
 
 	// Create job_segments table
 	_, err = q.db.Exec(`
@@ -70,26 +93,89 @@ func (q *PostgresJobQueue) InitSchema() error {
 			sequence_id INT NOT NULL,
 			duration FLOAT NOT NULL,
 			worker_id VARCHAR(255) NOT NULL,
-			worker_addr VARCHAR(255) NOT NULL,
 			timestamp FLOAT NOT NULL,
+			range_index INT DEFAULT 0,
 			created_at TIMESTAMPTZ DEFAULT NOW(),
 			PRIMARY KEY (job_id, sequence_id)
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Migration: add columns to existing job_segments
+	_, _ = q.db.Exec(`ALTER TABLE job_segments ADD COLUMN IF NOT EXISTS range_index INT DEFAULT 0;`)
+
+	// media_streams table for probe caching
+	_, err = q.db.Exec(`
+		CREATE TABLE IF NOT EXISTS media_streams (
+			media_id VARCHAR(255) PRIMARY KEY,
+			video_codec VARCHAR(50),
+			audio_codec VARCHAR(50),
+			container VARCHAR(50),
+			width INT,
+			height INT,
+			duration FLOAT,
+			keyframe_times TEXT,
+			probed_at TIMESTAMPTZ DEFAULT NOW()
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// jobColumns is the canonical column list for SELECT/RETURNING, kept in one place
+// to avoid Scan misalignment across Dequeue/GetJob/ListActiveJobs.
+const jobColumns = `id, media_id, file_path, status, worker_id, stream_url,
+			target_video_codec, target_audio_codec, target_container, needs_transcode,
+			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
+			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at,
+			discontinuity_count, failure_reason,
+			parent_job_id, range_index, total_ranges, range_start, range_end`
+
+// scanJob scans a row into a TranscodeJob using the canonical column order above.
+func scanJob(scanner interface{ Scan(...interface{}) error }) (*domain.TranscodeJob, error) {
+	job := &domain.TranscodeJob{}
+	var workerID, streamUrl, failureReason, parentJobID sql.NullString
+	var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
+
+	err := scanner.Scan(
+		&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &streamUrl,
+		&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
+		&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
+		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
+		&job.DiscontinuityCount, &failureReason,
+		&parentJobID, &job.RangeIndex, &job.TotalRanges, &job.RangeStart, &job.RangeEnd,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	job.WorkerID = workerID.String
+	job.StreamURL = streamUrl.String
+	job.LastHeartbeat = lastHeartbeat.Time
+	job.LastRecoveryTime = lastRecoveryTime.Time
+	job.LastAccessedAt = lastAccessedAt.Time
+	job.FailureReason = failureReason.String
+	job.ParentJobID = parentJobID.String
+	return job, nil
 }
 
 func (q *PostgresJobQueue) Enqueue(ctx context.Context, job *domain.TranscodeJob) error {
-	// UPSERT (ON CONFLICT DO UPDATE) to handle re-queuing existing jobs
 	query := `
 		INSERT INTO transcode_jobs (
-			id, media_id, file_path, status, target_video_codec, target_audio_codec, 
+			id, media_id, file_path, status, target_video_codec, target_audio_codec,
 			target_container, needs_transcode, restart_count, start_segment, start_time,
-			recovery_in_progress, last_recovery_time, last_accessed_at
+			recovery_in_progress, last_recovery_time, last_accessed_at, failure_reason,
+			parent_job_id, range_index, total_ranges, range_start, range_end
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, 
+			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9, $10, $11,
-			$12, $13, NOW()
+			$12, $13, NOW(), $14,
+			$15, $16, $17, $18, $19
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status,
@@ -98,26 +184,39 @@ func (q *PostgresJobQueue) Enqueue(ctx context.Context, job *domain.TranscodeJob
 			start_time = EXCLUDED.start_time,
 			recovery_in_progress = EXCLUDED.recovery_in_progress,
 			last_recovery_time = EXCLUDED.last_recovery_time,
-			last_accessed_at = NOW();
+			failure_reason = EXCLUDED.failure_reason,
+			worker_id = CASE WHEN EXCLUDED.recovery_in_progress THEN NULL ELSE transcode_jobs.worker_id END,
+			stream_url = CASE WHEN EXCLUDED.recovery_in_progress THEN NULL ELSE transcode_jobs.stream_url END,
+			last_heartbeat = CASE WHEN EXCLUDED.recovery_in_progress THEN NULL ELSE transcode_jobs.last_heartbeat END,
+			last_accessed_at = NOW()
+		WHERE transcode_jobs.recovery_in_progress = false
+		   OR transcode_jobs.last_recovery_time < NOW() - interval '5 seconds'
 	`
 
-	_, err := q.db.ExecContext(ctx, query,
+	res, err := q.db.ExecContext(ctx, query,
 		job.ID, job.MediaID, job.FilePath, job.Status, job.TargetVideoCodec, job.TargetAudioCodec,
 		job.TargetContainer, job.NeedsTranscode, job.RestartCount, job.StartSegment, job.StartTime,
-		job.RecoveryInProgress, job.LastRecoveryTime,
+		job.RecoveryInProgress, job.LastRecoveryTime, job.FailureReason,
+		nullableStr(job.ParentJobID), job.RangeIndex, job.TotalRanges, job.RangeStart, job.RangeEnd,
 	)
-
-	if err == nil {
-		log.Printf("[PostgresQueue] Enqueued job %s", job.ID)
+	if err != nil {
+		return err
 	}
-	return err
+
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		log.Printf("[PostgresQueue] Enqueue skipped for job %s (recovery in progress)", job.ID)
+		return domain.ErrRecoveryInProgress
+	}
+
+	log.Printf("[PostgresQueue] Enqueued job %s", job.ID)
+	return nil
 }
 
-func (q *PostgresJobQueue) Dequeue(ctx context.Context) (*domain.TranscodeJob, error) {
-	// SKIP LOCKED magic
+func (q *PostgresJobQueue) Dequeue(ctx context.Context, workerID string) (*domain.TranscodeJob, error) {
 	query := `
 		UPDATE transcode_jobs
-		SET status = 'Processing', last_heartbeat = NOW()
+		SET status = 'Processing', worker_id = $1, last_heartbeat = NOW()
 		WHERE id = (
 			SELECT id
 			FROM transcode_jobs
@@ -126,77 +225,36 @@ func (q *PostgresJobQueue) Dequeue(ctx context.Context) (*domain.TranscodeJob, e
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING 
-			id, media_id, file_path, status, worker_id, worker_address, stream_url,
-			target_video_codec, target_audio_codec, target_container, needs_transcode,
-			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
-			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at;
-	`
+		RETURNING ` + jobColumns
 
-	row := q.db.QueryRowContext(ctx, query)
-
-	job := &domain.TranscodeJob{}
-	var workerID, workerAddr, streamUrl sql.NullString
-	var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
-
-	err := row.Scan(
-		&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &workerAddr, &streamUrl,
-		&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
-		&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
-		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
-	)
-
+	row := q.db.QueryRowContext(ctx, query, workerID)
+	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
-		return nil, errors.New("empty queue")
+		return nil, ports.ErrEmptyQueue
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	job.WorkerID = workerID.String
-	job.WorkerAddress = workerAddr.String
-	job.StreamURL = streamUrl.String
-	job.LastHeartbeat = lastHeartbeat.Time
-	job.LastRecoveryTime = lastRecoveryTime.Time
-	job.LastAccessedAt = lastAccessedAt.Time
+	// H4: Return segments so recovery workers know what's been produced
+	segments, err := q.getSegments(ctx, job.ID)
+	if err != nil {
+		return nil, err
+	}
+	job.Segments = segments
 
-	log.Printf("[PostgresQueue] Dequeued job %s", job.ID)
+	log.Printf("[PostgresQueue] Dequeued job %s for worker %s", job.ID, workerID)
 	return job, nil
 }
 
 func (q *PostgresJobQueue) GetJob(ctx context.Context, jobID string) (*domain.TranscodeJob, error) {
-	query := `
-		SELECT 
-			id, media_id, file_path, status, worker_id, worker_address, stream_url,
-			target_video_codec, target_audio_codec, target_container, needs_transcode,
-			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
-			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at
-		FROM transcode_jobs WHERE id = $1
-	`
+	query := `SELECT ` + jobColumns + ` FROM transcode_jobs WHERE id = $1`
 	row := q.db.QueryRowContext(ctx, query, jobID)
-
-	job := &domain.TranscodeJob{}
-	var workerID, workerAddr, streamUrl sql.NullString
-	var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
-
-	err := row.Scan(
-		&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &workerAddr, &streamUrl,
-		&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
-		&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
-		&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
-	)
+	job, err := scanJob(row)
 	if err != nil {
 		return nil, err
 	}
 
-	job.WorkerID = workerID.String
-	job.WorkerAddress = workerAddr.String
-	job.StreamURL = streamUrl.String
-	job.LastHeartbeat = lastHeartbeat.Time
-	job.LastRecoveryTime = lastRecoveryTime.Time
-	job.LastAccessedAt = lastAccessedAt.Time
-
-	// Fetch segments
 	segments, err := q.getSegments(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -207,7 +265,9 @@ func (q *PostgresJobQueue) GetJob(ctx context.Context, jobID string) (*domain.Tr
 }
 
 func (q *PostgresJobQueue) getSegments(ctx context.Context, jobID string) ([]domain.Segment, error) {
-	rows, err := q.db.QueryContext(ctx, "SELECT sequence_id, duration, worker_id, worker_addr, timestamp FROM job_segments WHERE job_id = $1 ORDER BY sequence_id ASC", jobID)
+	rows, err := q.db.QueryContext(ctx,
+		"SELECT sequence_id, duration, worker_id, timestamp FROM job_segments WHERE job_id = $1 ORDER BY sequence_id ASC",
+		jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +276,7 @@ func (q *PostgresJobQueue) getSegments(ctx context.Context, jobID string) ([]dom
 	var segments []domain.Segment
 	for rows.Next() {
 		var s domain.Segment
-		if err := rows.Scan(&s.SequenceID, &s.Duration, &s.WorkerID, &s.WorkerAddr, &s.Timestamp); err != nil {
+		if err := rows.Scan(&s.SequenceID, &s.Duration, &s.WorkerID, &s.Timestamp); err != nil {
 			return nil, err
 		}
 		segments = append(segments, s)
@@ -225,24 +285,23 @@ func (q *PostgresJobQueue) getSegments(ctx context.Context, jobID string) ([]dom
 }
 
 func (q *PostgresJobQueue) UpdateJob(ctx context.Context, job *domain.TranscodeJob) error {
-	// We handle the "Max Value" logic for TranscodedDuration and LastSegmentNum here in SQL
-	// to prevent race conditions from staler heartbeats, matching the memory fix.
 	query := `
 		UPDATE transcode_jobs SET
 			status = $2,
 			worker_id = $3,
-			worker_address = $4,
-			stream_url = $5,
-			last_heartbeat = $6,
-			recovery_in_progress = $7,
-			last_segment_num = GREATEST(last_segment_num, $8),
-			transcoded_duration = GREATEST(transcoded_duration, $9)
+			stream_url = $4,
+			last_heartbeat = $5,
+			recovery_in_progress = $6,
+			last_segment_num = GREATEST(last_segment_num, $7),
+			failure_reason = $8
 		WHERE id = $1
+			AND worker_id = $3
+			AND status IN ('Processing', 'Ready')
 	`
 	res, err := q.db.ExecContext(ctx, query,
-		job.ID, job.Status, job.WorkerID, job.WorkerAddress, job.StreamURL,
+		job.ID, job.Status, job.WorkerID, job.StreamURL,
 		job.LastHeartbeat, job.RecoveryInProgress,
-		job.LastSegmentNum, job.TranscodedDuration,
+		job.LastSegmentNum, job.FailureReason,
 	)
 	if err != nil {
 		return err
@@ -252,7 +311,7 @@ func (q *PostgresJobQueue) UpdateJob(ctx context.Context, job *domain.TranscodeJ
 		return err
 	}
 	if rows == 0 {
-		return errors.New("job not found")
+		return errors.New("job not found or worker mismatch")
 	}
 	return nil
 }
@@ -264,23 +323,30 @@ func (q *PostgresJobQueue) AddSegment(ctx context.Context, jobID string, segment
 	}
 	defer tx.Rollback()
 
-	// Insert segment (ignore duplicates)
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO job_segments (job_id, sequence_id, duration, worker_id, worker_addr, timestamp)
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO job_segments (job_id, sequence_id, duration, worker_id, timestamp, range_index)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (job_id, sequence_id) DO NOTHING
-	`, jobID, segment.SequenceID, segment.Duration, segment.WorkerID, segment.WorkerAddr, segment.Timestamp)
+	`, jobID, segment.SequenceID, segment.Duration, segment.WorkerID, segment.Timestamp, 0)
 	if err != nil {
 		return err
 	}
 
-	// Update job aggregate stats
-	_, err = tx.ExecContext(ctx, `
-		UPDATE transcode_jobs 
-		SET last_segment_num = GREATEST(last_segment_num, $2),
-		    transcoded_duration = transcoded_duration + $3
-		WHERE id = $1
-	`, jobID, segment.SequenceID, segment.Duration)
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected > 0 {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE transcode_jobs
+			SET last_segment_num = GREATEST(last_segment_num, $2),
+			    transcoded_duration = transcoded_duration + $3
+			WHERE id = $1
+		`, jobID, segment.SequenceID, segment.Duration)
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE transcode_jobs
+			SET last_segment_num = GREATEST(last_segment_num, $2)
+			WHERE id = $1
+		`, jobID, segment.SequenceID)
+	}
 	if err != nil {
 		return err
 	}
@@ -288,74 +354,33 @@ func (q *PostgresJobQueue) AddSegment(ctx context.Context, jobID string, segment
 	return tx.Commit()
 }
 
-func (q *PostgresJobQueue) MarkWorkerAsDead(ctx context.Context, jobID string, workerID string) (int, error) {
-	// Delete segments from this worker
-	res, err := q.db.ExecContext(ctx, "DELETE FROM job_segments WHERE job_id = $1 AND worker_id = $2", jobID, workerID)
+func (q *PostgresJobQueue) MarkWorkerAsDead(ctx context.Context, jobID string, workerID string) error {
+	_, err := q.db.ExecContext(ctx,
+		"UPDATE transcode_jobs SET discontinuity_count = discontinuity_count + 1 WHERE id = $1",
+		jobID)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	deleted, _ := res.RowsAffected()
-	log.Printf("[PostgresQueue] Deleted %d segments from dead worker %s for job %s", deleted, workerID, jobID)
-
-	// Get the new last segment number
-	var lastSeg sql.NullInt32
-	err = q.db.QueryRowContext(ctx, "SELECT MAX(sequence_id) FROM job_segments WHERE job_id = $1", jobID).Scan(&lastSeg)
-	if err != nil {
-		return 0, err
-	}
-
-	// Reset the job's last_segment_num to match reality
-	// Also re-calculate duration (optional but good for consistency)
-	newLastSeg := int(lastSeg.Int32) // 0 if null
-
-	_, err = q.db.ExecContext(ctx, `
-		UPDATE transcode_jobs 
-		SET last_segment_num = $2
-		WHERE id = $1
-	`, jobID, newLastSeg)
-
-	return newLastSeg, err
-}
-
-func (q *PostgresJobQueue) PurgeJobs(ctx context.Context, jobID string) error {
-	// In memory impl this removed pending jobs from the queue array.
-	// In SQL, pending jobs are just rows with status='Pending'.
-	// Since ID is unique, PurgeJobs(jobID) for a specific ID implies removing/canceling that specific job?
-	// The interface comment says "Purge any stale pending tasks for this job".
-	// Since we use UPSERT in Enqueue, there's only ever one row per JobID.
-	// If the intent is to reset a Pending job that shouldn't be there, we can just Delete it?
-	// But Wait! In `memory/job_queue.go`:
-	/*
-		func (q *InMemoryJobQueue) PurgeJobs(ctx context.Context, jobID string) error {
-			// ... filters out jobs with ID == jobID from q.queue ...
-		}
-	*/
-	// This implies there could be multiple entries in the 'queue' list in memory for the same JobID?
-	// Ah, the memory queue is a slice of pointers. Enqueue appends.
-	// In Postgres, we maintain a single row per JobID.
-	// So "Purging" a pending job just means ensure it's not Pending anymore if we want to cancel it?
-	// OR, if we assume the caller calls Purge before Enqueueing a *new* recovery task,
-	// checking `triggerJITRecovery` in main.go:
-	// `queue.PurgeJobs(ctx, job.ID)` is called before `job.Status = "Pending"; queue.Enqueue(...)`.
-	// Since we use UPSERT in Enqueue, we effectively overwrite the old state anyway.
-	// So this might be a no-op for Postgres if we enforce uniqueness on JobID.
-
-	// However, if we want to be safe and match semantics:
-	// If the job is currently Pending, we could set it to Failed or something?
-	// But `triggerJITRecovery` immediately sets it to Pending again.
-	// So, we don't really need to do anything complex here given our UPSERT logic.
-	// Just logging for now.
-	log.Printf("[PostgresQueue] PurgeJobs called for %s (Handled via UPSERT logic in Enqueue)", jobID)
+	log.Printf("[PostgresQueue] Worker %s marked dead for job %s (discontinuity_count incremented)", workerID, jobID)
 	return nil
 }
 
+func (q *PostgresJobQueue) PurgeJobs(ctx context.Context, jobID string) error {
+	// Cancel any Pending rows for this job ID.
+	_, err := q.db.ExecContext(ctx,
+		"UPDATE transcode_jobs SET status = 'Cancelled' WHERE id = $1 AND status = 'Pending'",
+		jobID)
+	if err == nil {
+		log.Printf("[PostgresQueue] PurgeJobs: cancelled pending job %s", jobID)
+	}
+	return err
+}
+
 func (q *PostgresJobQueue) DeleteJob(ctx context.Context, jobID string) error {
-	// Delete segments first (FK)
 	_, err := q.db.ExecContext(ctx, "DELETE FROM job_segments WHERE job_id = $1", jobID)
 	if err != nil {
 		return err
 	}
-	// Delete job
 	_, err = q.db.ExecContext(ctx, "DELETE FROM transcode_jobs WHERE id = $1", jobID)
 	if err == nil {
 		log.Printf("[PostgresQueue] Deleted job %s and its segments", jobID)
@@ -368,16 +393,36 @@ func (q *PostgresJobQueue) TouchJob(ctx context.Context, jobID string) error {
 	return err
 }
 
+// Cheap heartbeat — only updates last_heartbeat + ownership check. No full-row write, no segment fetch.
+func (q *PostgresJobQueue) Heartbeat(ctx context.Context, jobID string, workerID string) error {
+	res, err := q.db.ExecContext(ctx,
+		"UPDATE transcode_jobs SET last_heartbeat = NOW() WHERE id = $1 AND worker_id = $2 AND status IN ('Processing','Ready')",
+		jobID, workerID)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return errors.New("job not found or worker mismatch")
+	}
+	return nil
+}
+
+// Single-row segment lookup — avoids fetching all segments on every .ts request.
+func (q *PostgresJobQueue) GetSegment(ctx context.Context, jobID string, seqID int) (*domain.Segment, error) {
+	var s domain.Segment
+	err := q.db.QueryRowContext(ctx,
+		"SELECT sequence_id, duration, worker_id, timestamp FROM job_segments WHERE job_id = $1 AND sequence_id = $2",
+		jobID, seqID,
+	).Scan(&s.SequenceID, &s.Duration, &s.WorkerID, &s.Timestamp)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 func (q *PostgresJobQueue) ListActiveJobs(ctx context.Context) ([]*domain.TranscodeJob, error) {
-	query := `
-		SELECT 
-			id, media_id, file_path, status, worker_id, worker_address, stream_url,
-			target_video_codec, target_audio_codec, target_container, needs_transcode,
-			last_heartbeat, restart_count, last_segment_num, transcoded_duration,
-			start_segment, start_time, recovery_in_progress, last_recovery_time, last_accessed_at
-		FROM transcode_jobs 
-		WHERE status IN ('Processing', 'Ready', 'Pending', 'Completed')
-	`
+	query := `SELECT ` + jobColumns + ` FROM transcode_jobs WHERE status IN ('Processing', 'Ready', 'Pending', 'Completed', 'Failed')`
 	rows, err := q.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -386,31 +431,137 @@ func (q *PostgresJobQueue) ListActiveJobs(ctx context.Context) ([]*domain.Transc
 
 	var jobs []*domain.TranscodeJob
 	for rows.Next() {
-		job := &domain.TranscodeJob{}
-		var workerID, workerAddr, streamUrl sql.NullString
-		var lastHeartbeat, lastRecoveryTime, lastAccessedAt sql.NullTime
-
-		err := rows.Scan(
-			&job.ID, &job.MediaID, &job.FilePath, &job.Status, &workerID, &workerAddr, &streamUrl,
-			&job.TargetVideoCodec, &job.TargetAudioCodec, &job.TargetContainer, &job.NeedsTranscode,
-			&lastHeartbeat, &job.RestartCount, &job.LastSegmentNum, &job.TranscodedDuration,
-			&job.StartSegment, &job.StartTime, &job.RecoveryInProgress, &lastRecoveryTime, &lastAccessedAt,
-		)
+		job, err := scanJob(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		job.WorkerID = workerID.String
-		job.WorkerAddress = workerAddr.String
-		job.StreamURL = streamUrl.String
-		job.LastHeartbeat = lastHeartbeat.Time
-		job.LastRecoveryTime = lastRecoveryTime.Time
-		job.LastAccessedAt = lastAccessedAt.Time
-
-		// NOTE: We generally don't need full segments list for the monitor check,
-		// but if we did, we'd fetch them here.
-		// For `startPassiveRecoveryMonitor`, we mostly need LastHeartbeat and WorkerID.
 		jobs = append(jobs, job)
 	}
 	return jobs, nil
+}
+
+// --- Phase 3: Sub-job helpers ---
+
+// EnqueueSubJob inserts a range sub-job linked to a parent.
+func (q *PostgresJobQueue) EnqueueSubJob(ctx context.Context, job *domain.TranscodeJob) error {
+	_, err := q.db.ExecContext(ctx, `
+		INSERT INTO transcode_jobs (
+			id, media_id, file_path, status, target_video_codec, target_audio_codec,
+			target_container, needs_transcode, start_segment, start_time,
+			parent_job_id, range_index, total_ranges, range_start, range_end
+		) VALUES (
+			$1, $2, $3, 'Pending', $4, $5,
+			$6, $7, $8, $9,
+			$10, $11, $12, $13, $14
+		)
+	`, job.ID, job.MediaID, job.FilePath, job.TargetVideoCodec, job.TargetAudioCodec,
+		job.TargetContainer, job.NeedsTranscode, job.StartSegment, job.StartTime,
+		nullableStr(job.ParentJobID), job.RangeIndex, job.TotalRanges, job.RangeStart, job.RangeEnd,
+	)
+	return err
+}
+
+// GetSubJobs returns all sub-jobs for a parent job.
+func (q *PostgresJobQueue) GetSubJobs(ctx context.Context, parentJobID string) ([]*domain.TranscodeJob, error) {
+	query := `SELECT ` + jobColumns + ` FROM transcode_jobs WHERE parent_job_id = $1 ORDER BY range_index ASC`
+	rows, err := q.db.QueryContext(ctx, query, parentJobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*domain.TranscodeJob
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+// IsParentJobCompleted returns true if all sub-jobs of the parent are Completed.
+func (q *PostgresJobQueue) IsParentJobCompleted(ctx context.Context, parentJobID string, totalRanges int) (bool, error) {
+	var count int
+	err := q.db.QueryRowContext(ctx,
+		"SELECT count(*) FROM transcode_jobs WHERE parent_job_id = $1 AND status = 'Completed'",
+		parentJobID,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count >= totalRanges, nil
+}
+
+// MarkParentCompleted sets the parent job status to Completed.
+func (q *PostgresJobQueue) MarkParentCompleted(ctx context.Context, parentJobID string) error {
+	_, err := q.db.ExecContext(ctx,
+		"UPDATE transcode_jobs SET status = 'Completed' WHERE id = $1",
+		parentJobID)
+	return err
+}
+
+// --- M6: Probe cache ---
+
+// CacheProbe stores or updates probe results for a media item.
+func (q *PostgresJobQueue) CacheProbe(ctx context.Context, mediaID string, probe *domain.MediaProbe) error {
+	_, err := q.db.ExecContext(ctx, `
+		INSERT INTO media_streams (media_id, video_codec, audio_codec, container, width, height, probed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		ON CONFLICT (media_id) DO UPDATE SET
+			video_codec = EXCLUDED.video_codec,
+			audio_codec = EXCLUDED.audio_codec,
+			container = EXCLUDED.container,
+			width = EXCLUDED.width,
+			height = EXCLUDED.height,
+			probed_at = NOW()
+	`, mediaID, probe.VideoCodec, probe.AudioCodec, probe.Container, probe.Width, probe.Height)
+	return err
+}
+
+// GetCachedProbe retrieves cached probe results.
+func (q *PostgresJobQueue) GetCachedProbe(ctx context.Context, mediaID string) (*domain.MediaProbe, error) {
+	var p domain.MediaProbe
+	err := q.db.QueryRowContext(ctx,
+		"SELECT video_codec, audio_codec, container, width, height FROM media_streams WHERE media_id = $1",
+		mediaID,
+	).Scan(&p.VideoCodec, &p.AudioCodec, &p.Container, &p.Width, &p.Height)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// CacheKeyframes stores keyframe PTS times for a media item (Phase 3).
+func (q *PostgresJobQueue) CacheKeyframes(ctx context.Context, mediaID string, keyframeTimes string) error {
+	_, err := q.db.ExecContext(ctx, `
+		INSERT INTO media_streams (media_id, keyframe_times, probed_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (media_id) DO UPDATE SET
+			keyframe_times = EXCLUDED.keyframe_times,
+			probed_at = NOW()
+	`, mediaID, keyframeTimes)
+	return err
+}
+
+// GetCachedKeyframes retrieves cached keyframe times.
+func (q *PostgresJobQueue) GetCachedKeyframes(ctx context.Context, mediaID string) (string, error) {
+	var kf string
+	err := q.db.QueryRowContext(ctx,
+		"SELECT keyframe_times FROM media_streams WHERE media_id = $1 AND keyframe_times IS NOT NULL",
+		mediaID,
+	).Scan(&kf)
+	if err != nil {
+		return "", err
+	}
+	return kf, nil
+}
+
+// nullableStr returns sql.NullString-compatible nil for empty strings (for nullable columns).
+func nullableStr(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }

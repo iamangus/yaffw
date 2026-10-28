@@ -3,21 +3,23 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yaffw/yaffw/src/internal/adapters/filesystem"
 	"github.com/yaffw/yaffw/src/internal/adapters/http_queue"
-	"github.com/yaffw/yaffw/src/internal/adapters/metadata/tmdb"
+	"github.com/yaffw/yaffw/src/internal/adapters/nfo"
+	omniarr_adapter "github.com/yaffw/yaffw/src/internal/adapters/omniarr"
 	"github.com/yaffw/yaffw/src/internal/adapters/postgres"
-	"github.com/yaffw/yaffw/src/internal/adapters/storage"
 	"github.com/yaffw/yaffw/src/internal/config"
 	"github.com/yaffw/yaffw/src/internal/domain"
 	"github.com/yaffw/yaffw/src/internal/ports"
@@ -25,11 +27,18 @@ import (
 )
 
 var playbackSvc *services.PlaybackService
+var transcodeCfg config.TranscodeConfig
+var segmentDir string // shared FS path (NFS) where worker writes .ts files and CP serves them
+var splitter *services.Splitter
+var pgJobQueue *postgres.PostgresJobQueue
+var mediaStore *services.MediaStore
+var metadataProviders map[string]ports.MetadataProvider
+var omniarrConfigs map[string]config.LibraryConfig
+var scanners map[string]*filesystem.Scanner
 
 func main() {
 	log.Println("Starting yaffw Control Plane...")
 
-	// Load Configuration
 	configFile := "config.yaml"
 	if len(os.Args) > 1 {
 		configFile = os.Args[1]
@@ -37,155 +46,205 @@ func main() {
 
 	var cfg config.ControlPlaneConfig
 	if err := config.Load(configFile, &cfg); err != nil {
-		log.Printf("Warning: Could not load config file '%s': %v", configFile, err)
-		log.Println("Falling back to Environment Variables / Defaults...")
-
-		// Fallback logic for backward compatibility / env var usage
+		log.Printf("Warning: Could not load config file '%s': %v. Using defaults/env.", configFile, err)
 		cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 		if cfg.DatabaseURL == "" {
 			cfg.DatabaseURL = "postgres://user:password@localhost:5432/yaffw?sslmode=disable"
-		}
-		cfg.DataDir = os.Getenv("DATA_DIR")
-		if cfg.DataDir == "" {
-			cfg.DataDir = "data"
 		}
 		cfg.Port = os.Getenv("PORT")
 		if cfg.Port == "" {
 			cfg.Port = "8096"
 		}
-		cfg.TMDBAPIKey = os.Getenv("TMDB_API_KEY")
-		cfg.ArtworkDir = os.Getenv("ARTWORK_DIR")
-		if cfg.ArtworkDir == "" {
-			cfg.ArtworkDir = "./artwork"
-		}
-		cfg.OIDC.ProviderURL = os.Getenv("OIDC_PROVIDER")
-		cfg.OIDC.ClientID = os.Getenv("OIDC_CLIENT_ID")
+		cfg.FrontendAPIKey = os.Getenv("FRONTEND_API_KEY")
 	} else {
 		log.Printf("Loaded configuration from %s", configFile)
 	}
 
-	// 1. Initialize Adapters
-	var mediaRepo ports.MediaRepository
-	var jobQueue ports.JobQueue
+	if len(cfg.Libraries) == 0 {
+		log.Println("Warning: No libraries configured.")
+	}
 
-	log.Println("Running in PRODUCTION mode")
-
-	// Connect to Postgres
 	db, err := postgres.NewConnection(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
 
-	// Initialize Postgres Media Repo
-	pgMediaRepo := postgres.NewMediaRepo(db)
-	if err := pgMediaRepo.InitSchema(); err != nil {
-		log.Fatalf("Failed to init media schema: %v", err)
-	}
-	mediaRepo = pgMediaRepo
-
-	// Initialize Postgres User & History Repos
-	pgUserRepo := postgres.NewUserRepo(db)
-	if err := pgUserRepo.InitSchema(); err != nil {
-		log.Fatalf("Failed to init user schema: %v", err)
+	identityRepo := postgres.NewIdentityRepo(db)
+	if err := identityRepo.InitSchema(context.Background()); err != nil {
+		log.Fatalf("Failed to init identity schema: %v", err)
 	}
 
-	pgHistoryRepo := postgres.NewHistoryRepo(db)
-	if err := pgHistoryRepo.InitSchema(); err != nil {
-		log.Fatalf("Failed to init history schema: %v", err)
-	}
-
-	// Auth Middleware
-	authMW := NewAuthMiddleware(pgUserRepo, cfg.OIDC)
-
-	// Initialize Postgres Job Queue
-	pgJobQueue := postgres.NewJobQueue(db)
+	pgJobQueue = postgres.NewJobQueue(db)
 	if err := pgJobQueue.InitSchema(); err != nil {
 		log.Fatalf("Failed to init queue schema: %v", err)
 	}
-	jobQueue = pgJobQueue
+	var jobQueue ports.JobQueue = pgJobQueue
 
-	// Initialize Metadata Components
-	pgMetadataQueue := postgres.NewMetadataQueue(db)
-	if err := pgMetadataQueue.InitSchema(); err != nil {
-		log.Fatalf("Failed to init metadata queue schema: %v", err)
+	transcodeCfg = cfg.Transcode.WithDefaults()
+	segmentDir = cfg.Transcode.SegmentDir
+	if v := os.Getenv("SEGMENT_DIR"); v != "" {
+		segmentDir = v
+	}
+	if err := os.MkdirAll(segmentDir, 0755); err != nil {
+		log.Fatalf("Failed to create segmentDir %s: %v", segmentDir, err)
+	}
+	splitter = services.NewSplitter(jobQueue, "ffprobe")
+
+	mediaStore = services.NewMediaStore()
+	metadataProviders = buildMetadataProviders(cfg.Libraries)
+	omniarrConfigs = make(map[string]config.LibraryConfig)
+	scanners = make(map[string]*filesystem.Scanner)
+
+	for _, lib := range cfg.Libraries {
+		provider := metadataProviders[lib.Name]
+		scanner := filesystem.NewScanner(lib, provider, identityRepo, mediaStore)
+		scanners[lib.Name] = scanner
+
+		if lib.MetadataProvider == "omniarr" {
+			omniarrConfigs[lib.Name] = lib
+		}
+
+		go func(l config.LibraryConfig, s *filesystem.Scanner) {
+			log.Printf("[Scanner] Starting initial scan for library '%s' at %s", l.Name, l.Path)
+			if err := s.Scan(context.Background()); err != nil {
+				log.Printf("[Scanner] Initial scan failed for '%s': %v", l.Name, err)
+			}
+
+			if l.ScanInterval != "" {
+				interval, err := time.ParseDuration(l.ScanInterval)
+				if err != nil || interval == 0 {
+					interval = 10 * time.Minute
+				}
+				go startPeriodicScan(context.Background(), l.Name, s, interval)
+			}
+
+			if l.WatchFS {
+				watcher, err := filesystem.NewWatcher(l.Path, s)
+				if err != nil {
+					log.Printf("[Watcher] Failed to start for '%s': %v", l.Name, err)
+				} else {
+					watcher.Start()
+					log.Printf("[Watcher] Started for library '%s'", l.Name)
+				}
+			}
+		}(lib, scanner)
 	}
 
-	pgLockManager := postgres.NewLockManager(db)
-	if err := pgLockManager.InitSchema(); err != nil {
-		log.Fatalf("Failed to init lock manager schema: %v", err)
-	}
+	log.Printf("Initialized %d metadata providers, %d libraries", len(metadataProviders), len(cfg.Libraries))
 
-	// TMDB Client
-	if cfg.TMDBAPIKey == "" {
-		log.Println("Warning: tmdb_api_key not set. Metadata fetching will fail.")
-	}
-	tmdbClient := tmdb.NewTMDBClient(cfg.TMDBAPIKey)
-
-	// Filesystem Image Store (NFS)
-	imageStore, err := storage.NewFilesystemImageStore(cfg.ArtworkDir)
-	if err != nil {
-		log.Fatalf("Failed to init image store: %v", err)
-	}
-
-	log.Println("Connected to Postgres (MediaRepo + JobQueue + MetadataQueue)")
-
-	// 2. Start Services
-
-	// A. Scanner Service (Producer) - Runs as Daemon with Leader Election
-	scanner := services.NewLibraryScanner(mediaRepo, pgMetadataQueue, pgLockManager)
-
-	// Start Scanner in background
-	go scanner.StartDaemon(context.Background(), cfg.DataDir, 30*time.Second)
-
-	// B. Metadata Service (Consumer) - Runs as Workers
-	metaSvc := services.NewMetadataService(mediaRepo, pgMetadataQueue, tmdbClient, imageStore, 3)
-	metaSvc.StartWorkers(context.Background())
-
-	// Initialize Playback Service
 	ffmpegPath := "ffmpeg"
-	playbackSvc = services.NewPlaybackService(mediaRepo, ffmpegPath)
+	playbackSvc = services.NewPlaybackService(ffmpegPath)
 
-	// Start Passive Recovery Monitor (JIT-Aware Reaper)
 	go startPassiveRecoveryMonitor(context.Background(), jobQueue)
-
-	// Start Session Watchdog (Cleans up idle jobs)
 	go startSessionWatchdog(context.Background(), jobQueue)
 
-	// 3. Expose Queue via HTTP
-	// We expose this in ALL modes now, so Workers can always connect via HTTP
-	// (Even in Prod, avoiding DB creds in workers)
+	simpleAuth := NewSimpleAuthMiddleware(cfg.FrontendAPIKey)
+
 	mux := http.NewServeMux()
-	queueServer := http_queue.NewHTTPServerQueue(jobQueue)
+	queueServer := http_queue.NewHTTPServerQueue(jobQueue, transcodeCfg.InternalToken)
 	queueServer.RegisterHandlers(mux)
 	log.Println("Exposing internal queue at /internal/queue/...")
 
-	// 4. Setup API Handlers
+	mux.Handle("/metrics", services.GlobalMetrics)
 
-	// Artwork Server (NFS)
-	// Serves files from /artwork/ path mapping to ARTWORK_DIR
-	mux.Handle("/artwork/", http.StripPrefix("/artwork/", http.FileServer(http.Dir(cfg.ArtworkDir))))
+	mux.HandleFunc("/images/", handleImageProxy)
 
-	// List Media API
-	mux.HandleFunc("/api/v1/media", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/local-images/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/local-images/"), "/", 2)
+		if len(parts) != 2 {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		itemID := parts[0]
+		filename := parts[1]
+
+		if filename == "" || strings.ContainsAny(filename, "/\\") || filename == ".." || strings.Contains(filename, "..") {
+			http.Error(w, "Invalid filename", http.StatusBadRequest)
+			return
+		}
+
+		item, ok := mediaStore.GetByID(itemID)
+		if !ok || item.Path == "" {
+			http.Error(w, "Media not found", http.StatusNotFound)
+			return
+		}
+
+		dir := filepath.Dir(item.Path)
+		fullPath := filepath.Join(dir, filename)
+
+		absDir, errDir := filepath.Abs(dir)
+		absFull, errFull := filepath.Abs(fullPath)
+		if errDir != nil || errFull != nil {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+		if !strings.HasPrefix(absFull, absDir+string(filepath.Separator)) {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		http.ServeFile(w, r, fullPath)
+	})
+
+	mux.Handle("/api/v1/libraries", simpleAuth.RequireAPIKey(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cfg.Libraries)
+	})))
+
+	mux.Handle("/api/v1/libraries/", simpleAuth.RequireAPIKey(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/libraries/"), "/")
+		if len(parts) < 2 || parts[1] != "scan" {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		libName := parts[0]
+		scanner, ok := scanners[libName]
+		if !ok {
+			http.Error(w, "Library not found", http.StatusNotFound)
+			return
+		}
+		go func() {
+			if err := scanner.Scan(context.Background()); err != nil {
+				log.Printf("[Scanner] Manual scan failed for '%s': %v", libName, err)
+			}
+		}()
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "scanning"})
+	})))
+
+	mux.Handle("/api/v1/media", simpleAuth.RequireAPIKey(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		items, err := mediaRepo.ListAll(r.Context())
-		if err != nil {
-			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
-			return
+		libraryID := r.URL.Query().Get("libraryId")
+		parentID := r.URL.Query().Get("parentId")
+
+		var items []*domain.MediaItem
+		if parentID != "" {
+			items = mediaStore.GetChildren(parentID)
+		} else if libraryID != "" {
+			items = mediaStore.ListByLibrary(libraryID)
+		} else {
+			items = mediaStore.ListAll()
 		}
 
-		log.Printf("[API] ListAll returning %d items", len(items))
-
+		log.Printf("[API] ListAll returning %d items (Library: %s, Parent: %s)", len(items), libraryID, parentID)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(items)
-	})
+	})))
 
-	// Get Media API
-	mux.HandleFunc("/api/v1/media/", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/v1/media/", simpleAuth.RequireAPIKey(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -197,60 +256,20 @@ func main() {
 			return
 		}
 
-		item, err := mediaRepo.GetByID(r.Context(), id)
-		if err != nil {
+		item, ok := mediaStore.GetByID(id)
+		if !ok {
 			http.Error(w, "Media not found", http.StatusNotFound)
 			return
 		}
 
+		metadata := fetchMetadataForItem(item)
+		item.Metadata = metadata
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(item)
-	})
+	})))
 
-	// Continue Watching API (Authenticated)
-	mux.HandleFunc("/api/v1/continue-watching", authMW.RequireAuth(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		userID := GetUserID(r.Context())
-		items, err := pgHistoryRepo.ListContinueWatching(r.Context(), userID)
-		if err != nil {
-			log.Printf("Failed to list continue watching: %v", err)
-			http.Error(w, "DB Error", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(items)
-	}))
-
-	// Save Progress API (Authenticated)
-	mux.HandleFunc("/api/v1/progress", authMW.RequireAuth(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var p domain.WatchProgress
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		p.UserID = GetUserID(r.Context())
-		p.UpdatedAt = time.Now()
-
-		if err := pgHistoryRepo.SaveProgress(r.Context(), &p); err != nil {
-			log.Printf("Failed to save progress: %v", err)
-			http.Error(w, "Failed to save", http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	// HLS Segment/Manifest Server (Smart Proxy & Playlist Generator)
 	mux.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Path is now "job-ID/stream.m3u8" or "job-ID/segment_001.ts"
 		parts := strings.Split(r.URL.Path, "/")
 		if len(parts) < 2 {
 			http.Error(w, "Invalid path", http.StatusBadRequest)
@@ -259,25 +278,24 @@ func main() {
 		jobID := parts[0]
 		filename := parts[1]
 
-		// 1. Get Job
-		job, err := jobQueue.GetJob(r.Context(), jobID)
-		if err != nil {
-			http.Error(w, "Job not found", http.StatusNotFound)
-			return
-		}
-
-		// Keep job alive
-		jobQueue.TouchJob(r.Context(), jobID)
-
-		// 2. Handle Playlist
 		if strings.HasSuffix(filename, ".m3u8") {
+			job, err := jobQueue.GetJob(r.Context(), jobID)
+			if err != nil {
+				http.Error(w, "Job not found", http.StatusNotFound)
+				return
+			}
+			if job.Status == "Failed" {
+				http.Error(w, "Transcode failed: "+job.FailureReason, http.StatusInternalServerError)
+				return
+			}
+			if err := jobQueue.TouchJob(r.Context(), jobID); err != nil {
+				log.Printf("[Control] TouchJob failed for job %s on playlist: %v", jobID, err)
+			}
 			serveDynamicPlaylist(w, job)
 			return
 		}
 
-		// 3. Handle Segments (Smart Proxy)
 		if strings.HasSuffix(filename, ".ts") {
-			// Parse segment number: segment_001.ts -> 1
 			numStr := strings.TrimSuffix(strings.TrimPrefix(filename, "segment_"), ".ts")
 			segNum, err := strconv.Atoi(numStr)
 			if err != nil {
@@ -285,76 +303,41 @@ func main() {
 				return
 			}
 
-			// Find segment in job state
-			var targetSegment *domain.Segment
-			for _, s := range job.Segments {
-				if s.SequenceID == segNum {
-					targetSegment = &s
-					break
-				}
+			if err := jobQueue.TouchJob(r.Context(), jobID); err != nil {
+				log.Printf("[Control] TouchJob failed for job %s on segment: %v", jobID, err)
 			}
 
-			if targetSegment != nil {
-				// Segment exists! Proxy to the worker that owns it.
-				targetURL, err := url.Parse(targetSegment.WorkerAddr)
-				if err != nil {
-					http.Error(w, "Invalid worker address", http.StatusInternalServerError)
+			seg, err := jobQueue.GetSegment(r.Context(), jobID, segNum)
+			if err == nil && seg != nil {
+				segPath := filepath.Join(segmentDir, jobID, filename)
+				if _, statErr := os.Stat(segPath); statErr == nil {
+					log.Printf("[Control] Serving segment %d for job %s from %s", segNum, jobID, segPath)
+					http.ServeFile(w, r, segPath)
 					return
+				} else if !os.IsNotExist(statErr) {
+					log.Printf("[Control] WARNING: os.Stat failed for segment %d path %s: %v", segNum, segPath, statErr)
 				}
+				log.Printf("[Control] Segment %d reported (DB row exists) but file missing on disk for job %s. Falling through to JIT.", segNum, jobID)
+			}
 
-				log.Printf("[Proxy] Forwarding request for segment %d to worker %s (%s)", segNum, targetSegment.WorkerID, targetURL)
-
-				proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-				// Handle Proxy Errors (Worker Dead/Unreachable)
-				proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-					log.Printf("[Proxy] Failed to proxy segment %d to %s (Worker: %s): %v", segNum, targetURL, targetSegment.WorkerID, err)
-
-					// 1. Mark worker as dead (remove its segments)
-					lastKnownSeg, err := jobQueue.MarkWorkerAsDead(r.Context(), jobID, targetSegment.WorkerID)
-					if err != nil {
-						log.Printf("Failed to mark worker as dead: %v", err)
-					}
-
-					// 2. Trigger JIT Recovery (Smart Forward Recovery)
-					// If the requested segment is much older than the last known segment,
-					// we should resume from the end to keep the stream alive, rather than rewinding.
-
-					recoveryStartSeg := segNum
-					if lastKnownSeg > segNum {
-						log.Printf("[Recovery] Requested segment %d is older than last known segment %d. Resuming from end to prevent rewind.", segNum, lastKnownSeg)
-						recoveryStartSeg = lastKnownSeg + 1
-					}
-
-					startTime := float64(recoveryStartSeg) * 4.0
-					if err := triggerJITRecovery(r.Context(), jobQueue, job, recoveryStartSeg, startTime); err != nil {
-						log.Printf("Failed to trigger recovery: %v", err)
-					}
-
-					// 3. Return 503 to client
-					w.Header().Set("Retry-After", "2")
-					http.Error(w, "Worker unreachable, recovering...", http.StatusServiceUnavailable)
-				}
-
-				proxy.ServeHTTP(w, r)
+			log.Printf("[Control] Segment %d missing for job %s. Triggering JIT Re-transcode.", segNum, jobID)
+			job, err := jobQueue.GetJob(r.Context(), jobID)
+			if err != nil {
+				http.Error(w, "Job not found", http.StatusNotFound)
+				return
+			}
+			if job.Status == "Failed" {
+				http.Error(w, "Transcode failed: "+job.FailureReason, http.StatusInternalServerError)
 				return
 			}
 
-			// Segment MISSING! Trigger JIT Re-transcode.
-			log.Printf("[Control] Segment %d missing for job %s. Triggering JIT Re-transcode.", segNum, jobID)
-
-			// Calculate start time for this segment
 			startTime := calculateStartTime(job, segNum)
-
-			// Trigger recovery
 			if err := triggerJITRecovery(r.Context(), jobQueue, job, segNum, startTime); err != nil {
-				log.Printf("Failed to trigger recovery: %v", err)
+				log.Printf("[Control] Failed to trigger recovery for job %s segment %d: %v", jobID, segNum, err)
 				http.Error(w, "Recovery failed", http.StatusInternalServerError)
 				return
 			}
 
-			// Return 503 Service Unavailable with Retry-After header
-			// The client should retry, by which time the new worker might be ready.
 			w.Header().Set("Retry-After", "2")
 			http.Error(w, "Segment regenerating...", http.StatusServiceUnavailable)
 			return
@@ -363,47 +346,99 @@ func main() {
 		http.Error(w, "Not found", http.StatusNotFound)
 	})))
 
-	// Smart Playback API
-	mux.HandleFunc("/api/playback/", func(w http.ResponseWriter, r *http.Request) {
-		handlePlaybackRequest(w, r, mediaRepo, jobQueue)
-	})
+	mux.Handle("/api/playback/", simpleAuth.RequireAPIKey(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlePlaybackRequest(w, r, jobQueue)
+	})))
 
-	// Session Management API (Stop Transcoding)
 	mux.HandleFunc("/api/session/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/session/"), "/")
+		if len(parts) < 1 {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+		mediaID := parts[0]
+		jobID := "job-" + mediaID
+
+		if len(parts) > 1 && parts[1] == "seek" {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", http.StatusMethodNotAllowed)
+				return
+			}
+			var seekReq struct {
+				Position float64 `json:"position"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&seekReq); err != nil {
+				http.Error(w, "Invalid JSON", http.StatusBadRequest)
+				return
+			}
+
+			log.Printf("[Session] Seek request for media %s to position %.2fs", mediaID, seekReq.Position)
+
+			if err := jobQueue.DeleteJob(r.Context(), jobID); err != nil {
+				log.Printf("[Session] Failed to delete old job %s for seek: %v", jobID, err)
+			}
+
+			startSeg := int(seekReq.Position / float64(transcodeCfg.HLSSegmentTime))
+			newJob := &domain.TranscodeJob{
+				ID:           jobID,
+				MediaID:      mediaID,
+				FilePath:     "",
+				Status:       "Pending",
+				StartSegment: startSeg,
+				StartTime:    seekReq.Position,
+			}
+			if oldJob, err := jobQueue.GetJob(r.Context(), jobID); err == nil {
+				newJob.FilePath = oldJob.FilePath
+				newJob.TargetVideoCodec = oldJob.TargetVideoCodec
+				newJob.TargetAudioCodec = oldJob.TargetAudioCodec
+				newJob.TargetContainer = oldJob.TargetContainer
+				newJob.NeedsTranscode = oldJob.NeedsTranscode
+			}
+			if newJob.FilePath == "" {
+				item, ok := mediaStore.GetByID(mediaID)
+				if !ok {
+					http.Error(w, "Media not found", http.StatusNotFound)
+					return
+				}
+				newJob.FilePath = item.Path
+				newJob.TargetVideoCodec = "libx264"
+				newJob.TargetAudioCodec = "aac"
+				newJob.TargetContainer = "hls"
+				newJob.NeedsTranscode = true
+			}
+
+			if err := jobQueue.Enqueue(r.Context(), newJob); err != nil {
+				log.Printf("[Session] Failed to enqueue seek job %s: %v", jobID, err)
+				http.Error(w, "Failed to start seek transcode", http.StatusInternalServerError)
+				return
+			}
+			log.Printf("[Session] Enqueued seek job %s (startSeg=%d, startTime=%.2fs)", jobID, startSeg, seekReq.Position)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
 		if r.Method != http.MethodDelete {
 			http.Error(w, "DELETE required", http.StatusMethodNotAllowed)
 			return
 		}
-
-		// Parse media ID from path /api/session/{id}
-		parts := strings.Split(r.URL.Path, "/")
-		if len(parts) < 4 {
-			http.Error(w, "Invalid path", http.StatusBadRequest)
-			return
-		}
-		mediaID := parts[3]
-		jobID := "job-" + mediaID
-
 		log.Printf("[Session] Explicit stop request for media %s (Job %s)", mediaID, jobID)
-
 		if err := jobQueue.DeleteJob(r.Context(), jobID); err != nil {
-			log.Printf("[Session] Failed to stop job %s: %v", jobID, err)
-			// Don't error out to client, as they are leaving anyway
+			log.Printf("[Session] Failed to delete job %s for stop: %v", jobID, err)
 		}
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Stream Handlers (Direct Play + HLS)
 	mux.HandleFunc("/stream/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".m3u8") {
-			handleHLS(w, r, mediaRepo, jobQueue)
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/stream/"), "/master.m3u8")
+			jobID := "job-" + id
+			http.Redirect(w, r, fmt.Sprintf("/hls/%s/stream.m3u8", jobID), http.StatusFound)
 			return
 		}
 
-		// Direct Stream
 		id := r.URL.Path[len("/stream/"):]
-		item, err := mediaRepo.GetByID(r.Context(), id)
-		if err != nil {
+		item, ok := mediaStore.GetByID(id)
+		if !ok {
 			http.Error(w, "Media not found", http.StatusNotFound)
 			return
 		}
@@ -415,15 +450,16 @@ func main() {
 		w.Write([]byte("Pong"))
 	})
 
-	// Client Logging Endpoint
 	mux.HandleFunc("/client-log", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			return
 		}
 		var msg map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&msg); err == nil {
-			log.Printf("[CLIENT] %s: %v", msg["level"], msg["message"])
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			log.Printf("[ClientLog] Failed to decode client log message: %v", err)
+			return
 		}
+		log.Printf("[CLIENT] %s: %v", msg["level"], msg["message"])
 	})
 
 	log.Printf("Control Plane listening on http://0.0.0.0:%s", cfg.Port)
@@ -432,20 +468,79 @@ func main() {
 	}
 }
 
-// PlaybackRequest from client
+func handleImageProxy(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/images/"), "/", 2)
+	if len(pathParts) != 2 {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	libraryName := pathParts[0]
+	filename := pathParts[1]
+
+	lib, ok := omniarrConfigs[libraryName]
+	if !ok {
+		http.Error(w, "Library not found", http.StatusNotFound)
+		return
+	}
+
+	omniarrImageURL := fmt.Sprintf("%s/images/%s", lib.OmniarrURL, filename)
+
+	req, err := http.NewRequest("GET", omniarrImageURL, nil)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-Api-Key", lib.OmniarrAPIKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to fetch image from omniarr: %v", err)
+		http.Error(w, "Image not found", http.StatusNotFound)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("[Images] Failed to proxy image bytes: %v", err)
+	}
+}
+
+func startPeriodicScan(ctx context.Context, libName string, scanner *filesystem.Scanner, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			log.Printf("[Scanner] Periodic scan for library '%s'", libName)
+			if err := scanner.Scan(ctx); err != nil {
+				log.Printf("[Scanner] Periodic scan failed for '%s': %v", libName, err)
+			}
+		}
+	}
+}
+
 type PlaybackRequest struct {
 	MediaID      string                    `json:"mediaId"`
 	Capabilities domain.ClientCapabilities `json:"capabilities"`
 }
 
-// PlaybackResponse to client
 type PlaybackResponse struct {
-	Type      string `json:"type"`      // "direct" or "transcode"
-	URL       string `json:"url"`       // Stream URL
-	MediaType string `json:"mediaType"` // MIME type hint
+	Type      string `json:"type"`
+	URL       string `json:"url"`
+	MediaType string `json:"mediaType"`
 }
 
-func handlePlaybackRequest(w http.ResponseWriter, r *http.Request, repo ports.MediaRepository, queue ports.JobQueue) {
+func handlePlaybackRequest(w http.ResponseWriter, r *http.Request, queue ports.JobQueue) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
@@ -457,32 +552,57 @@ func handlePlaybackRequest(w http.ResponseWriter, r *http.Request, repo ports.Me
 		return
 	}
 
-	// Get media item
-	item, err := repo.GetByID(r.Context(), req.MediaID)
-	if err != nil {
+	item, ok := mediaStore.GetByID(req.MediaID)
+	if !ok {
 		http.Error(w, "Media not found", http.StatusNotFound)
 		return
 	}
 
-	// Probe the media file
-	probe, err := playbackSvc.ProbeMedia(r.Context(), item.Path)
-	if err != nil {
-		log.Printf("Failed to probe %s: %v", item.Path, err)
-		// Fall back to transcoding if probe fails
-		resp := PlaybackResponse{
-			Type:      "transcode",
-			URL:       "/stream/" + req.MediaID + "/master.m3u8",
-			MediaType: "application/vnd.apple.mpegurl",
+	jobID := "job-" + req.MediaID
+	if existingJob, err := queue.GetJob(r.Context(), jobID); err == nil {
+		if existingJob.Status == "Ready" || existingJob.Status == "Processing" || existingJob.Status == "Completed" {
+			log.Printf("Active job %s found (Status: %s). Skipping probe.", jobID, existingJob.Status)
+			resp := PlaybackResponse{
+				Type:      "transcode",
+				URL:       fmt.Sprintf("/hls/%s/stream.m3u8", jobID),
+				MediaType: "application/vnd.apple.mpegurl",
+			}
+			if existingJob.StreamURL != "" {
+				resp.URL = existingJob.StreamURL
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
 		}
-		json.NewEncoder(w).Encode(resp)
-		return
 	}
 
-	// Determine playback strategy
+	var probe *domain.MediaProbe
+	if pgJobQueue != nil {
+		if cached, err := pgJobQueue.GetCachedProbe(r.Context(), req.MediaID); err == nil {
+			probe = cached
+			log.Printf("Using cached probe for %s", req.MediaID)
+		}
+	}
+	if probe == nil {
+		var err error
+		probe, err = playbackSvc.ProbeMedia(r.Context(), item.Path)
+		if err != nil {
+			log.Printf("Failed to probe %s: %v", item.Path, err)
+			resp := PlaybackResponse{
+				Type:      "transcode",
+				URL:       fmt.Sprintf("/hls/%s/stream.m3u8", jobID),
+				MediaType: "application/vnd.apple.mpegurl",
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if pgJobQueue != nil {
+			pgJobQueue.CacheProbe(r.Context(), req.MediaID, probe)
+		}
+	}
+
 	strategy := playbackSvc.DeterminePlaybackStrategy(probe, &req.Capabilities)
 
 	if !strategy.NeedsTranscode {
-		// Direct Play!
 		log.Printf("Direct Play for %s (video=%s, audio=%s)", item.Title, probe.VideoCodec, probe.AudioCodec)
 		resp := PlaybackResponse{
 			Type:      "direct",
@@ -493,13 +613,8 @@ func handlePlaybackRequest(w http.ResponseWriter, r *http.Request, repo ports.Me
 		return
 	}
 
-	// Needs Transcode - one job per media item
-	jobID := "job-" + req.MediaID
-
-	// Check if job already exists
 	existingJob, err := queue.GetJob(r.Context(), jobID)
 	if err != nil {
-		// Create new job with strategy settings
 		log.Printf("Queuing Transcode Job for %s (video: %s->%s, audio: %s->%s)",
 			item.Title, probe.VideoCodec, strategy.TargetVideoCodec,
 			probe.AudioCodec, strategy.TargetAudioCodec)
@@ -514,18 +629,27 @@ func handlePlaybackRequest(w http.ResponseWriter, r *http.Request, repo ports.Me
 			TargetContainer:  strategy.TargetContainer,
 			NeedsTranscode:   true,
 		}
-		queue.Enqueue(r.Context(), newJob)
+
+		if transcodeCfg.ParallelRanges > 1 && splitter != nil {
+			_, numSubJobs, splitErr := splitter.SplitAndEnqueue(r.Context(), newJob, transcodeCfg.ParallelRanges, float64(transcodeCfg.HLSSegmentTime))
+			if splitErr != nil {
+				log.Printf("Splitter failed, falling back to single job: %v", splitErr)
+				queue.Enqueue(r.Context(), newJob)
+			} else {
+				log.Printf("Split job %s into %d parallel sub-jobs", jobID, numSubJobs)
+			}
+		} else {
+			queue.Enqueue(r.Context(), newJob)
+		}
 		existingJob = newJob
 	}
 
-	// Return transcode URL
 	resp := PlaybackResponse{
 		Type:      "transcode",
 		URL:       fmt.Sprintf("/hls/%s/stream.m3u8", jobID),
 		MediaType: "application/vnd.apple.mpegurl",
 	}
 
-	// If job is already ready, use its stream URL
 	if existingJob.Status == "Ready" && existingJob.StreamURL != "" {
 		resp.URL = existingJob.StreamURL
 	}
@@ -533,77 +657,21 @@ func handlePlaybackRequest(w http.ResponseWriter, r *http.Request, repo ports.Me
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleHLS(w http.ResponseWriter, r *http.Request, repo ports.MediaRepository, queue ports.JobQueue) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 3 {
-		http.Error(w, "Invalid path", http.StatusBadRequest)
-		return
-	}
-	id := parts[2]
-	jobID := "job-" + id
-
-	// Check/Create Job
-	job, err := queue.GetJob(r.Context(), jobID)
-	if err != nil {
-		item, err := repo.GetByID(r.Context(), id)
-		if err != nil {
-			http.Error(w, "Media not found", http.StatusNotFound)
-			return
-		}
-
-		log.Printf("Queuing Transcode Job for %s (fallback, no capabilities provided)", item.Title)
-		newJob := &domain.TranscodeJob{
-			ID:               jobID,
-			MediaID:          item.ID,
-			FilePath:         item.Path,
-			Status:           "Pending",
-			TargetVideoCodec: "libx264",
-			TargetAudioCodec: "aac",
-			TargetContainer:  "hls",
-			NeedsTranscode:   true,
-		}
-		queue.Enqueue(r.Context(), newJob)
-		job = newJob
-	} else {
-		// Job exists, touch it
-		queue.TouchJob(r.Context(), jobID)
-	}
-
-	// Poll Status (Wait for at least one segment or Ready status)
-	timeout := time.After(30 * time.Second)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for job.Status != "Ready" && len(job.Segments) == 0 {
-		select {
-		case <-timeout:
-			http.Error(w, "Transcode timeout - Is Compute Plane running?", http.StatusGatewayTimeout)
-			return
-		case <-ticker.C:
-			j, err := queue.GetJob(r.Context(), jobID)
-			if err == nil {
-				job = j
-			}
-		}
-	}
-
-	log.Printf("Job Ready! Redirecting to %s", job.StreamURL)
-	http.Redirect(w, r, job.StreamURL, http.StatusFound)
-}
-
+// serveDynamicPlaylist generates an HLS .m3u8 playlist from the job's segments in the DB.
+// It injects #EXT-X-DISCONTINUITY tags whenever the WorkerID changes between adjacent
+// segments. Worker changes still matter under the shared-FS model because each worker
+// runs its own ffmpeg instance with independent GOP/keyframe alignment — a discontinuity
+// tag tells the player to reset its decoder state across the worker boundary.
 func serveDynamicPlaylist(w http.ResponseWriter, job *domain.TranscodeJob) {
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 
-	// Sort segments by SequenceID to ensure correct ordering
-	// This is critical when segments from multiple workers are mixed
 	sortedSegments := make([]domain.Segment, len(job.Segments))
 	copy(sortedSegments, job.Segments)
 	sort.Slice(sortedSegments, func(i, j int) bool {
 		return sortedSegments[i].SequenceID < sortedSegments[j].SequenceID
 	})
 
-	// Calculate max duration for TARGETDURATION
 	maxDuration := 5.0
 	for _, seg := range sortedSegments {
 		if seg.Duration > maxDuration {
@@ -611,23 +679,22 @@ func serveDynamicPlaylist(w http.ResponseWriter, job *domain.TranscodeJob) {
 		}
 	}
 
-	// Basic HLS Header
 	fmt.Fprintf(w, "#EXTM3U\n")
-	fmt.Fprintf(w, "#EXT-X-VERSION:6\n") // Version 6 for better discontinuity support
+	fmt.Fprintf(w, "#EXT-X-VERSION:6\n")
 	fmt.Fprintf(w, "#EXT-X-TARGETDURATION:%d\n", int(maxDuration)+1)
 	firstSeqID := 0
 	if len(sortedSegments) > 0 {
 		firstSeqID = sortedSegments[0].SequenceID
 	}
 	fmt.Fprintf(w, "#EXT-X-MEDIA-SEQUENCE:%d\n", firstSeqID)
-	fmt.Fprintf(w, "#EXT-X-PLAYLIST-TYPE:EVENT\n")
-	fmt.Fprintf(w, "#EXT-X-INDEPENDENT-SEGMENTS\n") // Each segment can be decoded independently
+	if job.DiscontinuityCount > 0 {
+		fmt.Fprintf(w, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", job.DiscontinuityCount)
+	}
+	fmt.Fprintf(w, "#EXT-X-INDEPENDENT-SEGMENTS\n")
 
-	// List all known segments with discontinuity markers
 	var lastWorkerID string
 	discontinuityCount := 0
 	for i, seg := range sortedSegments {
-		// Check for discontinuity (Worker changed)
 		if i > 0 && seg.WorkerID != lastWorkerID && lastWorkerID != "" {
 			fmt.Fprintf(w, "#EXT-X-DISCONTINUITY\n")
 			log.Printf("[Playlist] Discontinuity #%d injected between segment %d (worker %s) and segment %d (worker %s)",
@@ -640,38 +707,42 @@ func serveDynamicPlaylist(w http.ResponseWriter, job *domain.TranscodeJob) {
 		fmt.Fprintf(w, "segment_%03d.ts\n", seg.SequenceID)
 	}
 
-	// If job is done (not implemented yet), add ENDLIST.
-	// For now, we assume it's always live/growing until we have a "Completed" status.
-	if job.Status == "Completed" { // We don't have this status yet
+	if job.Status == "Completed" {
 		fmt.Fprintf(w, "#EXT-X-ENDLIST\n")
 	}
 
-	log.Printf("[Playlist] Generated dynamic playlist for job %s: %d segments (Range: %d-%d), Discontinuities: %d",
-		job.ID, len(sortedSegments),
-		func() int {
-			if len(sortedSegments) > 0 {
-				return sortedSegments[0].SequenceID
-			}
-			return 0
-		}(),
-		func() int {
-			if len(sortedSegments) > 0 {
-				return sortedSegments[len(sortedSegments)-1].SequenceID
-			}
-			return 0
-		}(),
-		discontinuityCount)
+	log.Printf("[Playlist] Generated dynamic playlist for job %s: %d segments, Discontinuities: %d",
+		job.ID, len(sortedSegments), discontinuityCount)
 }
 
+// highestSegmentOnDisk returns the sequence ID of the highest-numbered segment_NNN.ts file
+// present on the shared filesystem for a given job, or -1 if none exist.
+// filepath.Glob's only error is a malformed pattern; the pattern here is hardcoded and safe,
+// so the error is intentionally ignored.
+func highestSegmentOnDisk(segmentDir, jobID string) int {
+	matches, _ := filepath.Glob(filepath.Join(segmentDir, jobID, "segment_*.ts"))
+	max := -1
+	for _, m := range matches {
+		base := filepath.Base(m)
+		n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(base, "segment_"), ".ts"))
+		if err == nil && n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+// calculateStartTime estimates the media timestamp for a given segment number.
+// It first looks for an exact match (segment startSeg-1) to compute the precise offset,
+// then falls back to the closest available segment below startSeg, and finally to an
+// arithmetic estimate based on the HLS segment time.
 func calculateStartTime(job *domain.TranscodeJob, startSeg int) float64 {
-	// Try to find the immediately preceding segment
 	for _, s := range job.Segments {
 		if s.SequenceID == startSeg-1 {
 			return s.Timestamp + s.Duration
 		}
 	}
 
-	// Fallback: Iterate to find the highest sequence ID < startSeg
 	var bestSeg *domain.Segment
 	for i := range job.Segments {
 		s := &job.Segments[i]
@@ -683,38 +754,18 @@ func calculateStartTime(job *domain.TranscodeJob, startSeg int) float64 {
 	}
 
 	if bestSeg != nil {
-		// Estimate forward from the best segment we have
-		// Assuming 4s for missing segments in between (if any)
 		missingCount := startSeg - bestSeg.SequenceID - 1
-		return bestSeg.Timestamp + bestSeg.Duration + float64(missingCount)*4.0
+		return bestSeg.Timestamp + bestSeg.Duration + float64(missingCount)*float64(transcodeCfg.HLSSegmentTime)
 	}
 
-	// Total fallback
-	return float64(startSeg) * 4.0
+	return float64(startSeg) * float64(transcodeCfg.HLSSegmentTime)
 }
 
+// triggerJITRecovery re-enqueues a job for just-in-time segment recovery.
+// It sets the job to Pending and increments RestartCount. If the job is already
+// being recovered (RecoveryInProgress), the sentinel error is swallowed and nil
+// is returned — this is intentional de-duplication to avoid double-enqueue races.
 func triggerJITRecovery(ctx context.Context, queue ports.JobQueue, job *domain.TranscodeJob, startSeg int, startTime float64) error {
-	// Deduplication: Check if recovery is already in progress
-	// Prevents "recovery storms" where multiple missing segments trigger multiple recovery attempts
-	if job.RecoveryInProgress {
-		timeSinceLastRecovery := time.Since(job.LastRecoveryTime)
-		if timeSinceLastRecovery < 5*time.Second {
-			log.Printf("[Recovery] SKIPPED: Recovery already in progress for job %s (triggered %.1fs ago)",
-				job.ID, timeSinceLastRecovery.Seconds())
-			return nil
-		}
-		// If it's been more than 5 seconds, the previous recovery might have failed, allow retry
-		log.Printf("[Recovery] Previous recovery timeout (%.1fs ago), allowing new recovery attempt",
-			timeSinceLastRecovery.Seconds())
-	}
-
-	// Purge any stale pending tasks for this job from the queue to prevent workers
-	// from picking up obsolete recovery instructions (e.g. recovering an older segment)
-	if err := queue.PurgeJobs(ctx, job.ID); err != nil {
-		log.Printf("[Recovery] Warning: Failed to purge stale jobs for %s: %v", job.ID, err)
-	}
-
-	// 1. Mark job as recovering/pending
 	job.Status = "Pending"
 	job.RestartCount++
 	job.StartSegment = startSeg
@@ -722,21 +773,29 @@ func triggerJITRecovery(ctx context.Context, queue ports.JobQueue, job *domain.T
 	job.RecoveryInProgress = true
 	job.LastRecoveryTime = time.Now()
 
-	// 2. Enqueue it again (Compute Plane will pick it up)
-	// Note: In a real system, we might need to explicitly kill the old worker if it's still running but stuck.
-	// Here, we assume the old worker is dead or we just start a new one.
-	// The queue implementation handles deduplication or updates.
-
 	log.Printf("[Control] Re-queuing job %s for JIT recovery at segment %d", job.ID, startSeg)
-	return queue.Enqueue(ctx, job)
+	if err := queue.Enqueue(ctx, job); err != nil {
+		if errors.Is(err, domain.ErrRecoveryInProgress) {
+			log.Printf("[Recovery] SKIPPED: Recovery already in progress for job %s", job.ID)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
-// startPassiveRecoveryMonitor checks for dead jobs and triggers JIT recovery
-// This replaces the old "Reaper" service with a smarter, state-aware recovery mechanism.
+// startSessionWatchdog periodically reaps idle and completed jobs past their retention.
+// On reaping, it deletes both the DB row and the segment directory on the shared FS.
+// Note: if the process dies between DeleteJob and RemoveAll, segment files are orphaned
+// (DB row gone, files remain). A periodic orphan-cleanup job should be added if this
+// becomes a problem in practice.
 func startSessionWatchdog(ctx context.Context, queue ports.JobQueue) {
 	log.Println("Starting Session Watchdog...")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	idleThreshold := time.Duration(transcodeCfg.IdleTimeout) * time.Second
+	completedRetention := time.Duration(transcodeCfg.CompletedRetention) * time.Second
 
 	for {
 		select {
@@ -750,18 +809,23 @@ func startSessionWatchdog(ctx context.Context, queue ports.JobQueue) {
 			}
 
 			now := time.Now()
-			// Timeout after 60 seconds of inactivity
-			threshold := 60 * time.Second
-
 			for _, job := range jobs {
-				// Check LastAccessedAt
-				if !job.LastAccessedAt.IsZero() && now.Sub(job.LastAccessedAt) > threshold {
-					log.Printf("[Watchdog] 🛑 Job %s IDLE TIMEOUT (Last accessed: %s ago). Deleting...",
-						job.ID, now.Sub(job.LastAccessedAt))
-
-					// Delete the job (Worker will detect "Job Not Found" or Update error and exit)
+				if job.LastAccessedAt.IsZero() {
+					continue
+				}
+				idle := now.Sub(job.LastAccessedAt)
+				threshold := idleThreshold
+				if job.Status == "Completed" {
+					threshold = completedRetention
+				}
+				if idle > threshold {
+					log.Printf("[Watchdog] Job %s IDLE TIMEOUT (Status: %s, Last accessed: %s ago). Deleting...",
+						job.ID, job.Status, idle)
 					if err := queue.DeleteJob(ctx, job.ID); err != nil {
 						log.Printf("[Watchdog] Failed to delete job %s: %v", job.ID, err)
+					}
+					if err := os.RemoveAll(filepath.Join(segmentDir, job.ID)); err != nil {
+						log.Printf("[Watchdog] Failed to clean segment dir for job %s: %v", job.ID, err)
 					}
 				}
 			}
@@ -769,12 +833,20 @@ func startSessionWatchdog(ctx context.Context, queue ports.JobQueue) {
 	}
 }
 
-// startPassiveRecoveryMonitor checks for dead jobs and triggers JIT recovery
-// This replaces the old "Reaper" service with a smarter, state-aware recovery mechanism.
+// startPassiveRecoveryMonitor runs a 1s tick that:
+//   - detects dead workers (heartbeat timeout) and triggers JIT recovery from the
+//     latest segment file on disk (shared-FS model preserves segments across worker deaths)
+//   - retries Failed jobs up to MaxRestarts, then permanently cleans them up
+//
+// This is distinct from the JIT recovery triggered by the segment handler on a client
+// .ts request — this monitor catches dead workers proactively via heartbeat.
 func startPassiveRecoveryMonitor(ctx context.Context, queue ports.JobQueue) {
-	log.Println("Starting Passive Recovery Monitor (JIT-Aware)...")
-	ticker := time.NewTicker(1 * time.Second) // Check every second for fast recovery
+	log.Println("[Recovery] Starting Passive Recovery Monitor (heartbeat-based dead-worker detection + failed-job retry)")
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+
+	threshold := time.Duration(transcodeCfg.DeadWorkerThreshold) * time.Second
+	maxRestarts := transcodeCfg.MaxRestarts
 
 	for {
 		select {
@@ -783,59 +855,74 @@ func startPassiveRecoveryMonitor(ctx context.Context, queue ports.JobQueue) {
 		case <-ticker.C:
 			jobs, err := queue.ListActiveJobs(ctx)
 			if err != nil {
-				log.Printf("Recovery Monitor failed to list jobs: %v", err)
+				log.Printf("[Recovery] Failed to list active jobs: %v", err)
 				continue
 			}
 
 			now := time.Now()
-			threshold := 3 * time.Second // Fast Recovery: Allow 3 missed heartbeats (3s)
-
 			for _, job := range jobs {
-				// Skip Completed jobs (they don't need heartbeats)
 				if job.Status == "Completed" {
 					continue
 				}
 
+				if job.Status == "Failed" {
+					if job.RestartCount >= maxRestarts {
+						log.Printf("[Recovery] Job %s permanently failed after %d restarts. Cleaning up.", job.ID, job.RestartCount)
+						if err := queue.DeleteJob(ctx, job.ID); err != nil {
+							log.Printf("[Recovery] Failed to delete permanently-failed job %s: %v", job.ID, err)
+						}
+						if err := os.RemoveAll(filepath.Join(segmentDir, job.ID)); err != nil {
+							log.Printf("[Recovery] Failed to clean segment dir for permanently-failed job %s: %v", job.ID, err)
+						}
+						continue
+					}
+					log.Printf("[Recovery] Failed job %s (RestartCount: %d). Retrying from segment %d.",
+						job.ID, job.RestartCount, job.LastSegmentNum+1)
+					startSeg := job.LastSegmentNum + 1
+					startTime := job.TranscodedDuration
+					if startTime <= 0 {
+						startTime = calculateStartTime(job, startSeg)
+					}
+					if err := triggerJITRecovery(ctx, queue, job, startSeg, startTime); err != nil {
+						log.Printf("[Recovery] Failed to retry job %s: %v", job.ID, err)
+					}
+					continue
+				}
+
 				if !job.LastHeartbeat.IsZero() && now.Sub(job.LastHeartbeat) > threshold {
-					log.Printf("[Recovery] ⚠️ DETECTED DEAD WORKER (ID: %s) for Job %s. Last heartbeat: %s ago.",
+					log.Printf("[Recovery] DETECTED DEAD WORKER (ID: %s) for Job %s. Last heartbeat: %s ago.",
 						job.WorkerID, job.ID, now.Sub(job.LastHeartbeat))
 
-					// CRITICAL: Mark the dead worker's segments as invalid
-					// This prevents the proxy from trying to serve them from the dead worker
-					// and ensures discontinuity markers are properly placed
-					lastKnownSeg, err := queue.MarkWorkerAsDead(ctx, job.ID, job.WorkerID)
-					if err != nil {
+					if err := queue.MarkWorkerAsDead(ctx, job.ID, job.WorkerID); err != nil {
 						log.Printf("[Recovery] Failed to mark worker %s as dead: %v", job.WorkerID, err)
 					} else {
-						log.Printf("[Recovery] Marked worker %s as dead, removed its segments from job %s",
+						log.Printf("[Recovery] Marked worker %s as dead for job %s (discontinuity_count incremented)",
 							job.WorkerID, job.ID)
 					}
 
-					// Determine resume point from last reported segment
+					lastOnDisk := highestSegmentOnDisk(segmentDir, job.ID)
+
 					startSeg := 0
 					startTime := 0.0
 
-					// Use lastKnownSeg from MarkWorkerAsDead if available, otherwise use job.LastSegmentNum
-					if lastKnownSeg > 0 {
-						startSeg = lastKnownSeg + 1
-						log.Printf("[Recovery] Found existing segments (Last: %d). Resuming from Segment %d",
-							lastKnownSeg, startSeg)
+					if lastOnDisk >= 0 {
+						startSeg = lastOnDisk + 1
+						log.Printf("[Recovery] Found %d segment files on shared FS. Resuming from Segment %d",
+							lastOnDisk, startSeg)
 					} else if job.LastSegmentNum > 0 {
 						startSeg = job.LastSegmentNum + 1
-						log.Printf("[Recovery] Using LastSegmentNum: %d. Resuming from Segment %d",
+						log.Printf("[Recovery] No files on disk. Using LastSegmentNum: %d. Resuming from Segment %d",
 							job.LastSegmentNum, startSeg)
 					} else {
 						log.Printf("[Recovery] No existing segments found. Restarting from beginning.")
 					}
 
-					// Estimate start time based on segment number or use TranscodedDuration if available
 					if job.TranscodedDuration > 0 {
 						startTime = job.TranscodedDuration
 					} else {
 						startTime = calculateStartTime(job, startSeg)
 					}
 
-					// Trigger JIT Recovery
 					if err := triggerJITRecovery(ctx, queue, job, startSeg, startTime); err != nil {
 						log.Printf("[Recovery] CRITICAL: Failed to recover job %s: %v", job.ID, err)
 					}
@@ -843,4 +930,42 @@ func startPassiveRecoveryMonitor(ctx context.Context, queue ports.JobQueue) {
 			}
 		}
 	}
+}
+
+func buildMetadataProviders(libraries []config.LibraryConfig) map[string]ports.MetadataProvider {
+	providers := make(map[string]ports.MetadataProvider)
+	for _, lib := range libraries {
+		providerType := lib.MetadataProvider
+		if providerType == "" {
+			providerType = "nfo"
+		}
+		switch providerType {
+		case "omniarr":
+			if lib.OmniarrURL != "" {
+				client := omniarr_adapter.NewOmniarrClient(lib.OmniarrURL, lib.OmniarrAPIKey)
+				providers[lib.Name] = omniarr_adapter.NewOmniarrMetadataProvider(client, lib.Name)
+			} else {
+				log.Printf("[Config] Library '%s' has omniarr provider but no omniarr_url, falling back to nfo", lib.Name)
+				providers[lib.Name] = nfo.NewNFOMetadataProvider()
+			}
+		case "nfo":
+			fallthrough
+		default:
+			providers[lib.Name] = nfo.NewNFOMetadataProvider()
+		}
+	}
+	return providers
+}
+
+func fetchMetadataForItem(item *domain.MediaItem) *domain.MediaMetadata {
+	provider, ok := metadataProviders[item.LibraryID]
+	if !ok {
+		return &domain.MediaMetadata{Title: item.Title}
+	}
+	meta, err := provider.FetchMetadata(context.Background(), item)
+	if err != nil {
+		log.Printf("[Metadata] Provider %T returned error for %s: %v", provider, item.ID, err)
+		return &domain.MediaMetadata{Title: item.Title}
+	}
+	return meta
 }

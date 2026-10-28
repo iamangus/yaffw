@@ -3,5 +3,5 @@ port: "3000"
 oidc:
   provider_url: "https://auth.srvd.dev/auth/realms/master"
   client_id: "devapp"
-  client_secret: "FRRKYSLN6qums42IMzMWPj3Pg8MtMsHN"
+  client_secret: "YOUR_CLIENT_SECRET"
   redirect_url: "https://devapp.srvd.site/auth/callback"
